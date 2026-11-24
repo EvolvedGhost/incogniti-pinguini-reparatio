@@ -38,6 +38,9 @@ internal object NTServiceFetcher {
 
             initNTKernelListener(msgService)
             antiBackgroundMode(sessionService)
+            // QQ 9.x：群列表只能靠内核监听推送，这里尽早挂上，之后 get_group_list 直接读缓存
+            runCatching { GroupListCache.attach(sessionService.groupService) }
+                .onFailure { LogCenter.log("GroupListCache 初始化失败: ${it.message}", Level.WARN) }
             //hookGuildListener(sessionService)
         }
     }

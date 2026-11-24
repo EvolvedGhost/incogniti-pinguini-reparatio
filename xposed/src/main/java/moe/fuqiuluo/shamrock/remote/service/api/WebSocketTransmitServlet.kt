@@ -124,7 +124,13 @@ internal abstract class WebSocketTransmitServlet(
             handler?.handle(ActionSession(params, echo))
                 ?: resultToString(false, Status.UnsupportedAction, EmptyObject, "不支持的Action", echo = echo)
         }.getOrNull()
-        respond?.let { conn.send(it) }
+        // 客户端可能在请求处理期间断开，此时 conn.send 会抛 WebsocketNotConnectedException。
+        // 原来没有捕获，异常逃出 GlobalScope.launch 直接把 QQ 主进程干掉（FATAL EXCEPTION）。
+        respond?.let {
+            runCatching { conn.send(it) }.onFailure { e ->
+                LogCenter.log("WSServer回包失败(连接已断开): ${e.javaClass.simpleName}", Level.WARN)
+            }
+        }
     }
 
     override fun onError(conn: WebSocket, ex: Exception?) {

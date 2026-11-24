@@ -316,6 +316,10 @@ internal suspend inline fun PipelineContext<Unit, ApplicationCall>.respond(
     msg: String = "",
     echo: JsonElement = EmptyJsonString
 ) {
+    // 记录客户端实际连接的 Host，用于拼出 /res 资源链接的对外地址
+    runCatching {
+        moe.fuqiuluo.shamrock.xposed.helper.ImageRes.observeHost(call.request.headers["Host"])
+    }
     call.respond(
         CommonResult(
         if (isOk) "ok" else "failed",

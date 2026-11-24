@@ -135,16 +135,35 @@ internal sealed class MessageElemConverter: IMessageConvert {
                 ImageMapping(md5.uppercase(), chatType, image.fileSize)
             )
 
+            val originUrl = image.originImageUrl?.takeIf { it.isNotBlank() }
+
+            // 首选 Shamrock 自己的 /res/<md5> 服务：QQ 的签名链接会过期，
+            // md5 直链已 404，originImageUrl 又缺 rkey。
+            // sourcePath 有文件就直接复制；没有则登记并后台让 QQ 内核下载（不阻塞这里）。
+            val localUrl = runCatching {
+                moe.fuqiuluo.shamrock.xposed.helper.ImageRes.publish(md5, image.sourcePath)
+                    ?: moe.fuqiuluo.shamrock.xposed.helper.ImageRes.ensure(
+                        md5, chatType, peerId, subPeer, element
+                    )
+            }.getOrNull()
+            if (localUrl == null) {
+                moe.fuqiuluo.shamrock.helper.LogCenter.log(
+                    "[ImageRes] md5=$md5 未能本地发布, sourcePath=${image.sourcePath}, origin=${originUrl?.take(60)}"
+                )
+            }
+
             return MessageSegment(
                 type = "image",
                 data = hashMapOf(
                     "file" to md5,
-                    "url" to when(chatType) {
+                    "url" to (localUrl ?: originUrl?.let { u ->
+                        if (u.startsWith("/")) "https://multimedia.nt.qq.com.cn$u" else u
+                    } ?: when(chatType) {
                         MsgConstant.KCHATTYPEGROUP -> RichProtoSvc.getGroupPicDownUrl(md5)
                         MsgConstant.KCHATTYPEC2C -> RichProtoSvc.getC2CPicDownUrl(md5)
                         MsgConstant.KCHATTYPEGUILD -> RichProtoSvc.getGuildPicDownUrl(md5)
                         else -> unknownChatType(chatType)
-                    },
+                    }),
                     "subType" to image.picSubType,
                     "type" to if (image.isFlashPic == true) "flash" else if(image.original) "original" else "show"
                 )

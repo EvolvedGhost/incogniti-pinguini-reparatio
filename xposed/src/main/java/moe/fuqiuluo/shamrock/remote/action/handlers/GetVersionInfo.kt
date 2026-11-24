@@ -23,6 +23,7 @@ internal object GetVersionInfo : IActionHandler() {
                 impl = "shamrock",
                 version = ShamrockVersion,
                 onebotVersion = "11",
+                protocolVersion = "v11",
             ),
             echo = echo
         )

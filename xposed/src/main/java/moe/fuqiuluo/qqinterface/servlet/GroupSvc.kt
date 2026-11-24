@@ -732,10 +732,14 @@ internal object GroupSvc: BaseSvc() {
 
         return suspendCancellableCoroutine { continuation ->
             val waiter = GlobalScope.launch {
+                // 同 FriendSvc：isTroopCacheInited 在 QQ 9.2.95 上不会翻转，
+                // 原来的 do-while 会无限循环导致 get_group_list 永不返回。
+                var waited = 0L
                 do {
-                    delay(1000)
+                    delay(500)
+                    waited += 500
                 } while (
-                    !service.isTroopCacheInited
+                    !service.isTroopCacheInited && waited < 5000L
                 )
                 continuation.resume(true)
             }

@@ -1,16 +1,21 @@
 package moe.fuqiuluo.shamrock.remote.action.handlers
 
-import com.tencent.mobileqq.data.Card
 import kotlinx.serialization.json.JsonElement
-import moe.fuqiuluo.qqinterface.servlet.GroupSvc
 import moe.fuqiuluo.shamrock.remote.action.ActionSession
 import moe.fuqiuluo.shamrock.remote.action.IActionHandler
 import moe.fuqiuluo.shamrock.remote.service.data.SimpleTroopMemberInfo
 import moe.fuqiuluo.shamrock.remote.service.data.push.MemberRole
 import moe.fuqiuluo.shamrock.tools.EmptyJsonString
 import moe.fuqiuluo.shamrock.tools.ifNullOrEmpty
+import moe.fuqiuluo.shamrock.xposed.helper.GroupMemberCache
 import moe.fuqiuluo.symbols.OneBotHandler
 
+/**
+ * QQ 9.x（NT 架构）下 GroupSvc.getGroupMemberList 会永久挂起
+ * （IBizTroopMemberInfoService 那套已废弃）。
+ * 改走 NT 内核 IKernelGroupService.getTransferableMemberInfo 获取成员，
+ * 结果缓存在 GroupMemberCache，请求侧最多等 6 秒，为客户端默认超时留出余量。
+ */
 @OneBotHandler("get_group_member_list")
 internal object GetTroopMemberList : IActionHandler() {
     override suspend fun internalHandle(session: ActionSession): String {
@@ -24,56 +29,52 @@ internal object GetTroopMemberList : IActionHandler() {
         refresh: Boolean,
         echo: JsonElement = EmptyJsonString
     ): String {
-        val memberList = GroupSvc.getGroupMemberList(groupId, refresh).onFailure {
-            return error(it.message ?: "unknown error", echo, arrayResult = true)
-        }.getOrThrow()
-        val prohibitedMemberList = GroupSvc.getProhibitedMemberList(groupId.toLong())
-            .getOrDefault(arrayListOf())
-            .associate { it.memberUin to it.shutuptimestap.toLong() }
-        return ok(arrayListOf<SimpleTroopMemberInfo>().apply {
-            memberList.forEach { info ->
-                if (info.memberuin != "0") {
-                    add(
-                        SimpleTroopMemberInfo(
-                            uin = info.memberuin.toLong(),
-                            name = info.friendnick.ifNullOrEmpty(info.autoremark) ?: "",
-                            showName = info.troopnick.ifNullOrEmpty(info.troopColorNick),
-                            cardName = info.troopnick.ifNullOrEmpty(info.troopColorNick),
-                            distance = info.distance,
-                            honor = GroupSvc.parseHonor(info.honorList),
-                            joinTime = info.join_time,
-                            lastActiveTime = info.last_active_time,
-                            uniqueName = info.mUniqueTitle,
-                            groupId = groupId.toLong(),
-                            nick = info.friendnick.ifNullOrEmpty(info.autoremark) ?: "",
-                            sex = when (info.sex.toShort()) {
-                                Card.FEMALE -> "female"
-                                Card.MALE -> "male"
-                                else -> "unknown"
-                            },
-                            area = info.alias ?: "",
-                            lastSentTime = info.last_active_time,
-                            level = info.level,
-                            role = GroupSvc.getMemberRole(groupId.toLong(), info.memberuin.toLong())
-                            /*when {
-                                GroupSvc.getOwner(groupId)
-                                    .toString() == info.memberuin -> MemberRole.Owner
-                                info.memberuin.toLong() in GroupSvc.getAdminList(groupId) -> MemberRole.Admin
-                                else -> MemberRole.Member
-                            }*/,
-                            unfriendly = false,
-                            title = info.mUniqueTitle ?: "",
-                            titleExpireTime = info.mUniqueTitleExpire,
-                            cardChangeable = GroupSvc.isAdmin(groupId),
-                            age = 0,
-                            shutUpTimestamp = prohibitedMemberList[info.memberuin.toLong()] ?: 0L
-                        )
-                    )
-                }
-            }
+        val groupCode = groupId.toLongOrNull()
+            ?: return error("group_id 非法: $groupId", echo, arrayResult = true)
+
+        // 请求路径只读缓存：命中就返回，没有就返回空，绝不在这里触发拉取。
+        // 单人成员信息由 get_group_member_info 负责，那里有 5 分钟冷却和 CardSvc 兜底。
+        val members = runCatching {
+            GroupMemberCache.cached(groupCode) ?: emptyList()
+        }.getOrElse { emptyList() }
+
+        runCatching {
+            moe.fuqiuluo.shamrock.helper.LogCenter.log(
+                "[get_group_member_list] group=$groupCode 成员数=${members.size}"
+            )
+        }
+
+        return ok(members.mapNotNull { info ->
+            val uin = info.uin
+            if (uin <= 0L) return@mapNotNull null
+            val cardName = info.cardName?.takeIf { it.isNotBlank() }
+            val nick = (info.nick ?: "").ifNullOrEmpty(info.remark) ?: ""
+            SimpleTroopMemberInfo(
+                uin = uin,
+                groupId = groupCode,
+                name = nick,
+                sex = "unknown",
+                age = 0,
+                title = "",
+                titleExpireTime = 0,
+                nick = nick,
+                showName = cardName,
+                cardName = cardName,
+                distance = 0,
+                honor = emptyList(),
+                joinTime = 0L,
+                lastActiveTime = 0L,
+                lastSentTime = 0L,
+                uniqueName = null,
+                area = "",
+                level = 0,
+                role = MemberRole.Member,
+                unfriendly = false,
+                cardChangeable = false,
+                shutUpTimestamp = info.shutUpTime.toLong()
+            )
         }, echo)
     }
 
     override val requiredParams: Array<String> = arrayOf("group_id")
 }
-

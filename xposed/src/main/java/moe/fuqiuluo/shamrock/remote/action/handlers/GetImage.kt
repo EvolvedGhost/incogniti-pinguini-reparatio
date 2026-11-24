@@ -35,8 +35,10 @@ internal object GetImage: IActionHandler() {
             image.size,
             image.fileName,
             when(image.chatType) {
-                MsgConstant.KCHATTYPEGROUP -> RichProtoSvc.getGroupPicDownUrl(fileMd5)
-                MsgConstant.KCHATTYPEC2C -> RichProtoSvc.getC2CPicDownUrl(fileMd5)
+                MsgConstant.KCHATTYPEGROUP -> moe.fuqiuluo.shamrock.xposed.helper.ImageRes.urlFor(fileMd5)
+                    ?: RichProtoSvc.getGroupPicDownUrl(fileMd5)
+                MsgConstant.KCHATTYPEC2C -> moe.fuqiuluo.shamrock.xposed.helper.ImageRes.urlFor(fileMd5)
+                    ?: RichProtoSvc.getC2CPicDownUrl(fileMd5)
                 else -> error("Not supported chat type: ${image.chatType}, convertMsgElementsToMsgSegment::Pic")
             }
         ), echo = echo)

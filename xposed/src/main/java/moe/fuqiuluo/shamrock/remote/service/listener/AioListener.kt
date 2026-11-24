@@ -23,6 +23,7 @@ import moe.fuqiuluo.shamrock.remote.service.data.push.PostType
 import java.util.ArrayList
 import java.util.Collections
 import kotlin.collections.HashMap
+import moe.fuqiuluo.shamrock.xposed.helper.ImageRes
 
 internal object AioListener : IKernelMsgListener {
     // 通过MSG SEQ临时监听器
@@ -402,7 +403,8 @@ internal object AioListener : IKernelMsgListener {
     }
 
     override fun onRichMediaDownloadComplete(fileTransNotifyInfo: FileTransNotifyInfo) {
-
+        // 图片下载落盘通知：命中我们等的那张就复制到 /res 目录
+        runCatching { ImageRes.onDownloadComplete(fileTransNotifyInfo) }
     }
 
     override fun onRichMediaProgerssUpdate(fileTransNotifyInfo: FileTransNotifyInfo) {

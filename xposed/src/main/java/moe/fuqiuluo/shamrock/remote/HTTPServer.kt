@@ -37,6 +37,14 @@ internal object HTTPServer {
     internal var currServerPort: Int = 0
 
     private fun Application.configModule() {
+        // 记录客户端实际连接的 Host，用于拼出 /res 资源链接的对外地址
+        intercept(io.ktor.server.application.ApplicationCallPipeline.Setup) {
+            runCatching {
+                moe.fuqiuluo.shamrock.xposed.helper.ImageRes.observeHost(
+                    context.request.headers["Host"]
+                )
+            }
+        }
         install(Auth).let {
             val token = ShamrockConfig.getToken()
             if (token.isBlank()) {

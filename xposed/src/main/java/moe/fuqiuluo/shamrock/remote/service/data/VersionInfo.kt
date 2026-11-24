@@ -14,5 +14,9 @@ data class VersionInfo(
     val impl: String,
     val version: String,
     @SerialName("onebot_version")
-    val onebotVersion: String
+    val onebotVersion: String,
+    // OneBot 11 规范要求 get_version_info 返回 protocol_version: "v11"，
+    // 按 OneBot 11 规范固定返回 "v11"，部分客户端会据此校验实现是否合规
+    @SerialName("protocol_version")
+    val protocolVersion: String
 )

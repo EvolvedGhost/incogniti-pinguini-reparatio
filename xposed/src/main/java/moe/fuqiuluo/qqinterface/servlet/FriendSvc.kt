@@ -107,8 +107,13 @@ internal object FriendSvc: BaseSvc() {
         service.requestFriendList(true, 0)
         return suspendCancellableCoroutine { continuation ->
             val waiter = GlobalScope.launch {
-                while (!dataService.isInitFinished) {
+                // QQ 9.2.95 上 isInitFinished 永远不会变成 true，
+                // 原来的 while 会无限空转导致 get_friend_list 永不返回。
+                // 加重试上限，到点就带着当前缓存返回。
+                var waited = 0L
+                while (!dataService.isInitFinished && waited < 5000L) {
                     delay(200)
+                    waited += 200
                 }
                 continuation.resume(true)
             }
