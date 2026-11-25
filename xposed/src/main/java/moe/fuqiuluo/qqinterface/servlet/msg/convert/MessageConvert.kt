@@ -92,6 +92,9 @@ internal object MessageConvert {
             MsgConstant.KCHATTYPEGUILD -> record.guildId
             else -> record.peerUin.toString()
         }
+        // 富媒体下载需要 msgId / msgSeq / msgRandom / msgTime，
+        // 用元素实例做键传给 ImageConverter（同一实例会流转到转换器）
+        record.elements.forEach { ElemMeta.put(it, record.msgId, record.msgSeq, record.msgRandom, record.msgTime) }
         return convertMessageElementsToMsgSegment(chatType, record.elements, peerId, record.channelId ?: peerId)
     }
 

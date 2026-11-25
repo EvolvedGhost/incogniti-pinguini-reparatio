@@ -3,6 +3,7 @@ package moe.fuqiuluo.shamrock.xposed.helper
 import com.tencent.qqnt.kernel.nativeinterface.FileTransNotifyInfo
 import com.tencent.qqnt.kernel.nativeinterface.MsgConstant
 import com.tencent.qqnt.kernel.nativeinterface.MsgElement
+import kotlinx.coroutines.delay
 import moe.fuqiuluo.shamrock.helper.Level
 import moe.fuqiuluo.shamrock.helper.LogCenter
 import moe.fuqiuluo.shamrock.remote.service.config.ShamrockConfig
@@ -12,29 +13,56 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 
 /**
  * 图片落盘与对外 URL。
  *
- * QQ 9.2.95 的图片链接均不可用：
- *  - md5 直链 http://gchat.qpic.cn/gchatpic_new/0/0-0-<MD5>/0?term=2 返回 404；
- *  - PicElement.originImageUrl 形如 /download?...&spec=0，缺少 rkey，
- *    请求多媒体域名返回 retcode -5503010（invalid rkey）；
- *  - 收到的群图片 PicElement.sourcePath 为 null，原图未被落盘。
+ * 客户端上报的图片直链不可依赖：md5 直链已失效，originImageUrl 缺少 rkey 会被
+ * 多媒体域名拒绝，收到的消息里 sourcePath 通常为空、原图并未落盘。
  *
- * 因此主动请内核下载原图：
+ * 因此这里主动请求内核下载原图：
  *   wrapperSession.richMediaService.downloadRichMediaInVisit(RichDownLoadReq)
  * 该接口没有回调，落盘时机只能通过 IKernelMsgListener.onRichMediaDownloadComplete(
- * FileTransNotifyInfo) 得知。这里维护 wanted(md5) 集合：下载完成 -> 计算 md5 ->
- * 命中则落到 FileUtils.getFile(md5) 的约定位置（files/<md5 后 4 位>/<md5>），
+ * FileTransNotifyInfo) 得知。这里维护 wanted 登记表：下载完成 -> 与请求侧的
+ * elementId 关联 -> 落到 FileUtils.getFile(md5) 的约定位置（files/<md5 后 4 位>/<md5>），
  * 由已有的 /res/<md5> 路由对外提供。
  *
  * 约束：消息转换路径只能“登记 + 起后台线程后立即返回”，阻塞会拖停整条消息推送。
  */
 object ImageRes {
     private val published = ConcurrentHashMap<String, String>()   // md5 -> url
-    private val wanted = ConcurrentHashMap.newKeySet<String>()     // 等待落盘的 md5
+    private val wanted = ConcurrentHashMap<String, Long>()         // 等待落盘的 md5 -> 过期时间
     private const val MAX_COPY = 32L * 1024 * 1024
+    private const val WANTED_TTL = 60_000L        // 等待登记的存活时间
+    private const val MAX_PENDING = 12            // 同时等待落盘的上限
+    private const val THUMB_FALLBACK_WAIT_MS = 8_000L  // 原图等这么久不到就退缩略图
+    private const val MAX_PUBLISHED = 4096        // 已发布 URL 缓存上限
+
+    private val worker = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "shamrock-image-res").apply { isDaemon = true }
+    }
+
+    /** 单张图片的内核下载参数，供后台下载线程使用 */
+    private data class Meta(
+        val element: MsgElement?,
+        val chatType: Int,
+        val peerUid: String,
+        val senderUid: String,
+        val msgId: Long,
+        val msgSeq: Long,
+        val msgRandom: Long,
+        val msgTime: Long
+    )
+
+    private val known = ConcurrentHashMap<String, Meta>()
+    private const val MAX_KNOWN = 128
+
+    // 完成事件里的文件名是 QQ 内部缓存名（Cache_xxx），内容也可能被重新编码，
+    // 因此不能靠 md5 匹配。改用请求与完成事件共享的 msgElementId / msgId 关联。
+    private val byElement = ConcurrentHashMap<Long, String>()   // msgElementId -> md5
+    private val byMsg = ConcurrentHashMap<Long, String>()       // msgId -> md5
+    private const val MAX_LINKS = 256
 
     @Volatile
     private var baseUrl: String? = null       // 对外基地址
@@ -54,49 +82,232 @@ object ImageRes {
         } else null
     }
 
-    /** 把已知本地路径的图片发布出去（sourcePath 可用时） */
-    fun publish(md5: String, sourcePath: String?): String? {
+@Volatile
+    private var downloadFlag: Boolean? = null
+
+    /** 可选开关：files/shamrock_image_dl.txt 写 0 表示只发链接、不触发内核下载（排查用） */
+    private fun downloadEnabled(): Boolean {
+        downloadFlag?.let { return it }
+        val enabled = runCatching {
+            val f = FileUtils.getFile("shamrock_image_dl.txt")
+            if (f.isFile) f.readText().trim() != "0" else true
+        }.getOrDefault(true)
+        downloadFlag = enabled
+        return enabled
+    }
+
+    /**
+     * 本地兜底：内核取不到原图时，看看 QQ 自己在磁盘上有没有任何版本的这张图。
+     *
+     * QQ 的取图缩略图缓存按 md5 命名（Tencent/QQfile_recv/.thumbnails/<md5>_750.jpg），
+     * 用户点开过的图片会留在这里，能拿到就返回它 —— 宁可给小图也不给客户端 404。
+     */
+    fun localFallback(md5: String): File? {
         val key = md5.lowercase()
-        published[key]?.let { return it }
-        val src = sourcePath?.takeIf { it.isNotBlank() }?.let { File(it) } ?: return null
-        if (!src.isFile || src.length() <= 0L || src.length() > MAX_COPY) return null
-        if (!copyToRes(key, src)) return null
-        return "${resolveBase()}/res/$key".also { published[key] = it }
+        targetFile(key).takeIf { it.isFile && it.length() > 0 }?.let { return it }
+        // getFile 返回 <externalFilesDir>/<md5 后 4 位>/<md5>，上溯三级得到应用私有根目录，
+        // Tencent 缓存目录与之同级
+        val appRoot = targetFile(key).parentFile?.parentFile?.parentFile
+        val roots = ArrayList<File>()
+        if (appRoot != null) {
+            roots.add(File(appRoot, "Tencent/QQfile_recv/.thumbnails"))
+            roots.add(File(appRoot, "Tencent/MobileQQ/.thumbnails"))
+            roots.add(File(appRoot, "Tencent/MobileQQ/thumb"))
+        }
+        for (dir in roots) {
+            val hit = runCatching {
+                dir.listFiles()?.firstOrNull {
+                    it.isFile && it.length() > 0 && it.name.lowercase().startsWith(key)
+                }
+            }.getOrNull()
+            if (hit != null) return hit
+        }
+        return null
+    }
+
+    /** 串行下载队列：单个线程依次执行，队列满才丢弃（丢弃会记日志，便于观察） */
+    private val downloadQueue = java.util.concurrent.ThreadPoolExecutor(
+        1, 1, 30L, java.util.concurrent.TimeUnit.SECONDS,
+        java.util.concurrent.ArrayBlockingQueue(256),
+        { r -> Thread(r, "ShamrockImageDl").apply { isDaemon = true } },
+        java.util.concurrent.ThreadPoolExecutor.AbortPolicy()
+    )
+
+    private fun submitDownload(task: () -> Unit) {
+        runCatching { downloadQueue.execute(task) }
+            .onFailure { LogCenter.log("[ImageRes] 下载队列已满，丢弃任务", Level.WARN) }
+    }
+
+    /** 后台线程里轮询等待目标文件出现 */
+    private fun waitForFile(md5: String, timeoutMs: Long): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val f = targetFile(md5)
+            if (f.isFile && f.length() > 0) return true
+            try { Thread.sleep(300L) } catch (e: InterruptedException) { return false }
+        }
+        val f = targetFile(md5)
+        return f.isFile && f.length() > 0
+    }
+
+    /** 自有线程上执行：把本地已有文件复制进 /res 目录，成功返回 true */
+    private fun copyFrom(md5: String, path: String): Boolean {
+        val src = File(path)
+        if (!src.isFile || src.length() <= 0L || src.length() > MAX_COPY) return false
+        if (!copyToRes(md5, src)) return false
+        wanted.remove(md5)
+        rememberPublished(md5)
+        return true
+    }
+
+    /** 记录已发布 URL，条目过多时整体回收，避免无限增长 */
+    private fun rememberPublished(md5: String) {
+        published[md5] = "${resolveBase()}/res/$md5"
+        if (published.size > MAX_PUBLISHED) published.clear()
     }
 
     /**
      * 保证图片最终可用：本地已有 -> 直接 URL；否则登记 + 后台触发下载，**立即返回 URL**。
      * 文件未到位时 /res 返回 404，稍后重试即可。
      */
-    fun ensure(md5: String, chatType: Int, peerUid: String, senderUid: String, element: MsgElement?): String {
+    fun ensure(
+        md5: String,
+        chatType: Int,
+        peerUid: String,
+        senderUid: String,
+        element: MsgElement?,
+        sourcePath: String? = null,
+        msgId: Long = 0L,
+        msgSeq: Long = 0L,
+        msgRandom: Long = 0L,
+        msgTime: Long = 0L
+    ): String {
         val key = md5.lowercase()
         urlFor(key)?.let { return it }
 
         val url = "${resolveBase()}/res/$key"
-        if (wanted.add(key)) {
+        if (known.size > MAX_KNOWN) known.clear()
+        known[key] = Meta(element, chatType, peerUid, senderUid, msgId, msgSeq, msgRandom, msgTime)
+        if (byElement.size > MAX_LINKS) byElement.clear()
+        if (byMsg.size > MAX_LINKS) byMsg.clear()
+        runCatching { element?.elementId ?: 0L }.getOrNull()?.takeIf { it > 0L }?.let { byElement[it] = key }
+        if (msgId > 0L) byMsg[msgId] = key
+        wanted.entries.removeIf { it.value <= System.currentTimeMillis() }
+        if (!isWanted(key) && wanted.size < MAX_PENDING) {
+            wanted[key] = System.currentTimeMillis() + WANTED_TTL
             Thread {
-                runCatching { triggerDownload(key, chatType, peerUid, senderUid, element) }
-                    .onFailure { LogCenter.log("[ImageRes] 触发下载失败 $key: ${it.javaClass.simpleName}", Level.WARN) }
+                if (!downloadEnabled()) {
+                    // 只登记不下载：用于排查内核下载与消息通路的相互影响
+                    wanted.remove(key)
+                    return@Thread
+                }
+                // 先用消息里带的本地路径（有的话），失败再让内核下载。
+                // 只走前一条路的话，路径失效的图片会永远 404。
+                val copied = sourcePath
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { runCatching { copyFrom(key, it) }.getOrDefault(false) }
+                    ?: false
+                if (!copied) {
+                    // 内核下载统一排进单线程队列：串行执行，既不并发压内核，也不丢任务
+                    submitDownload {
+                        runCatching {
+                            triggerDownload(key, chatType, peerUid, senderUid, element, msgId, msgSeq, msgRandom, msgTime)
+                        }.onFailure { LogCenter.log("[ImageRes] 触发下载失败 $key: ${it.javaClass.simpleName}", Level.WARN) }
+
+                        // 兜底：这类图片内核永远不回调，等一会儿再单独申请一次缩略图。
+                        // 宁可给小图也不让客户端拿到 404。
+                        if (!waitForFile(key, THUMB_FALLBACK_WAIT_MS)) {
+                            LogCenter.log("[ImageRes] 原图未到，退而取缩略图 $key")
+                            runCatching {
+                                triggerDownload(key, chatType, peerUid, senderUid, element,
+                                    msgId, msgSeq, msgRandom, msgTime, downloadType = 1)
+                            }
+                        }
+                    }
+                }
             }.apply { isDaemon = true }.start()
         }
         return url
     }
 
-    /** 由 AioListener.onRichMediaDownloadComplete 调用 */
+    /**
+     * 等待图片就绪：文件已在则立即返回；该图正在后台下载时最多等 timeoutMs。
+     *
+     * 只做被动等待，**不在这里重试内核下载**：请求链路上反复调内核会占满内核的
+     * 处理线程，导致整个接口失去响应。下载请求的发起一律留在消息转换时的后台线程里。
+     */
+    suspend fun await(md5: String, timeoutMs: Long = 20_000L): File? {
+        val key = md5.lowercase()
+        targetFile(key).takeIf { it.isFile && it.length() > 0 }?.let { return it }
+        if (!isWanted(key)) return null
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            delay(150L)
+            targetFile(key).takeIf { it.isFile && it.length() > 0 }?.let { return it }
+            if (!isWanted(key)) break
+        }
+        return targetFile(key).takeIf { it.isFile && it.length() > 0 }
+    }
+
+    /** 该图是否仍在等待下载（登记有有效期，失败的请求不会永久占用等待状态） */
+    private fun isWanted(md5: String): Boolean =
+        (wanted[md5] ?: 0L) > System.currentTimeMillis()
+
+    /** 按文件头魔数判断 MIME 类型：/res 链接不带扩展名，只能看内容 */
+    fun mimeOf(file: File): String {
+        val head = ByteArray(12)
+        val n = runCatching { file.inputStream().use { it.read(head) } }.getOrDefault(0)
+        fun at(i: Int) = head[i].toInt().and(0xFF)
+        return when {
+            n >= 3 && at(0) == 0xFF && at(1) == 0xD8 && at(2) == 0xFF -> "image/jpeg"
+            n >= 4 && at(0) == 0x89 && at(1) == 0x50 && at(2) == 0x4E && at(3) == 0x47 -> "image/png"
+            n >= 3 && at(0) == 0x47 && at(1) == 0x49 && at(2) == 0x46 -> "image/gif"
+            n >= 12 && at(0) == 0x52 && at(8) == 0x57 && at(9) == 0x45 && at(10) == 0x42 && at(11) == 0x50 -> "image/webp"
+            n >= 2 && at(0) == 0x42 && at(1) == 0x4D -> "image/bmp"
+            n >= 4 && at(0) == 0x1A && at(1) == 0x45 && at(2) == 0xDF && at(3) == 0xA3 -> "video/webm"
+            else -> "application/octet-stream"
+        }
+    }
+
+    /**
+     * 由 AioListener.onRichMediaDownloadComplete 调用。
+     *
+     * 该回调跑在 QQ 自己的线程上，所以**只取路径就返回**：算 md5、复制文件这类
+     * 活全部丢到自有线程。该回调对所有富媒体（图片/语音/视频/文件）都会触发，
+     * 在回调里做 IO 会占住 QQ 的处理线程，累积起来会让消息回调与内核查询整体停摆。
+     */
     fun onDownloadComplete(info: FileTransNotifyInfo?) {
         val path = runCatching { info?.filePath }.getOrNull() ?: return
         if (path.isBlank()) return
-        val file = File(path)
-        if (!file.isFile || file.length() <= 0L || file.length() > MAX_COPY) return
-        if (wanted.isEmpty()) return   // 没人等就不做哈希，省开销
+        if (wanted.isEmpty()) return
+        // 回调线程上只查表，不碰文件
+        val eid = runCatching { info?.msgElementId ?: 0L }.getOrDefault(0L)
+        val mid = runCatching { info?.msgId ?: 0L }.getOrDefault(0L)
+        val md5 = byElement.remove(eid) ?: byMsg[mid]
+        LogCenter.log("[ImageRes] 完成事件 ${File(path).name} eid=$eid mid=$mid → md5=${md5 ?: "未匹配"}")
+        runCatching { worker.execute { handleCompleted(path, md5) } }
+    }
 
-        val md5 = runCatching { md5Of(file) }.getOrNull() ?: return
-        if (!wanted.contains(md5)) return
+    /** 自有线程上执行：命中等待中的 md5 才复制到 /res 目录 */
+    private fun handleCompleted(path: String, knownMd5: String?) {
+        val file = File(path)
+        if (!file.isFile || file.length() <= 0L) return
+        val now = System.currentTimeMillis()
+        wanted.entries.removeIf { it.value <= now }   // 清理过期的登记
+        if (wanted.isEmpty()) return
+        if (file.length() > MAX_COPY) return           // 超大文件不是图片
+
+        // 优先用 elementId/msgId 关联到的 md5，其次文件名，最后才整文件哈希
+        val md5 = knownMd5
+            ?: wanted.keys.firstOrNull { file.name.contains(it, ignoreCase = true) }
+            ?: runCatching { md5Of(file) }.getOrNull()
+            ?: return
+        if (!isWanted(md5)) return
 
         val size = file.length()
         if (copyToRes(md5, file)) {
             wanted.remove(md5)
-            published[md5] = "${resolveBase()}/res/$md5"
+            rememberPublished(md5)
             LogCenter.log("[ImageRes] 下载完成并发布 $md5 (${size}B)")
         }
     }
@@ -108,8 +319,19 @@ object ImageRes {
         if (dest.isFile && dest.length() == src.length()) return true
         return runCatching {
             dest.parentFile?.mkdirs()
-            if (!dest.exists() && src.renameTo(dest)) return true
-            src.copyTo(dest, overwrite = true)
+            // 硬链接优先（同分区零拷贝）：链接本身是原子操作，读到的一定是完整文件。
+            // 绝不移动 QQ 自己的媒体文件：搬走会破坏 QQ 的缓存与后续发图。
+            val linked = runCatching { java.nio.file.Files.createLink(dest.toPath(), src.toPath()) }.isSuccess
+            if (!linked) {
+                // 跨分区只能复制：先写临时文件再原子改名，
+                // 否则 /res 可能在复制途中读到半个文件，客户端拿到截断的图片。
+                val tmp = File(dest.parentFile, "${dest.name}.part")
+                src.copyTo(tmp, overwrite = true)
+                if (!tmp.renameTo(dest)) {
+                    tmp.delete()
+                    throw IllegalStateException("publish rename failed")
+                }
+            }
             true
         }.getOrElse {
             LogCenter.log("[ImageRes] 复制失败 ${it.javaClass.simpleName}: ${it.message}", Level.WARN)
@@ -117,7 +339,18 @@ object ImageRes {
         }
     }
 
-    private fun triggerDownload(md5: String, chatType: Int, peerUid: String, senderUid: String, element: MsgElement?) {
+    private fun triggerDownload(
+        md5: String,
+        chatType: Int,
+        peerUid: String,
+        senderUid: String,
+        element: MsgElement?,
+        msgId: Long,
+        msgSeq: Long,
+        msgRandom: Long,
+        msgTime: Long,
+        downloadType: Int = if (chatType == MsgConstant.KCHATTYPEGROUP) 2 else 1
+    ) {
         if (element == null) {
             LogCenter.log("[ImageRes] $md5 缺少 MsgElement，无法触发内核下载", Level.WARN)
             return
@@ -147,7 +380,9 @@ object ImageRes {
         set("chatType", chatType)
         set("peerUid", peerUid)
         set("senderUid", senderUid)
-        set("downloadType", if (chatType == MsgConstant.KCHATTYPEGROUP) 2 else 1)
+        // 注意：填入 msgId/msgSeq/msgRandom/msgTime 会让内核拒绝下载，
+        // 下载完成回调一次都不会再触发，因此保持默认 0。
+        set("downloadType", downloadType)
         set("thumbSize", 0)
         set("useHttps", 1)
 
@@ -182,6 +417,7 @@ object ImageRes {
      * 端口固定为 HTTP 端口，避免 WebSocket 客户端把资源链接拼到只提供 WS 的端口上。
      */
     fun observeHost(host: String?) {
+        if (baseLocked) return          // 已确定就不再判断，避免每个请求都枚举网卡
         val h = host?.trim()?.takeIf { it.isNotBlank() } ?: return
         val hostOnly = h.substringBefore(":").trim().takeIf { it.isNotEmpty() } ?: return
         if (hostOnly == "localhost" || hostOnly == "0.0.0.0") return

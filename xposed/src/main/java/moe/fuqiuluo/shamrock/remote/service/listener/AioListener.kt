@@ -26,10 +26,25 @@ import kotlin.collections.HashMap
 import moe.fuqiuluo.shamrock.xposed.helper.ImageRes
 
 internal object AioListener : IKernelMsgListener {
+    /** 最后一次收到消息事件的时刻，用于判断监听是否已静默脱落 */
+    @Volatile
+    var lastMsgAt: Long = 0L
+        private set
+
+    @Volatile
+    var msgCount: Long = 0L
+        private set
+
+    fun noteMsgEvent() {
+        lastMsgAt = System.currentTimeMillis()
+        msgCount++
+    }
+
     // 通过MSG SEQ临时监听器
     internal val messageLessListenerMap = Collections.synchronizedMap(HashMap<Long, MsgRecord.() -> Unit>())
 
     override fun onRecvMsg(msgList: ArrayList<MsgRecord>) {
+        noteMsgEvent()
         if (msgList.isEmpty()) return
 
         GlobalScope.launch {
@@ -394,8 +409,8 @@ internal object AioListener : IKernelMsgListener {
     }
 
     override fun onRichMediaUploadComplete(notifyInfo: FileTransNotifyInfo) {
-        LogCenter.log("onRichMediaUploadComplete($notifyInfo)", Level.DEBUG)
-        RichMediaUploadHandler.notify(notifyInfo)
+        // 该回调在 QQ 线程上，任何异常都不能逃出去
+        runCatching { RichMediaUploadHandler.notify(notifyInfo) }
     }
 
     override fun onRecvOnlineFileMsg(arrayList: ArrayList<MsgRecord>?) {
@@ -403,7 +418,7 @@ internal object AioListener : IKernelMsgListener {
     }
 
     override fun onRichMediaDownloadComplete(fileTransNotifyInfo: FileTransNotifyInfo) {
-        // 图片下载落盘通知：命中我们等的那张就复制到 /res 目录
+        // 图片下载落盘通知：命中等待中的图片就复制到 /res 目录
         runCatching { ImageRes.onDownloadComplete(fileTransNotifyInfo) }
     }
 

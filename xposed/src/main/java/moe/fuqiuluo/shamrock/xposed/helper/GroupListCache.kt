@@ -5,7 +5,18 @@ import com.tencent.qqnt.kernel.nativeinterface.IKernelGroupListener
 import com.tencent.qqnt.kernel.nativeinterface.IKernelGroupService
 import moe.fuqiuluo.shamrock.helper.LogCenter
 import java.lang.reflect.Proxy
+import java.util.concurrent.Executors
 import java.util.concurrent.ConcurrentHashMap
+
+private val logExec = Executors.newSingleThreadExecutor { r ->
+    Thread(r, "shamrock-grouplist-log").apply { isDaemon = true }
+}
+
+/** 内核回调线程上不允许同步写日志文件（LogCenter 是同步落盘的），统一转后台 */
+private fun logAsync(msg: String) {
+    runCatching { logExec.execute { LogCenter.log(msg) } }
+}
+
 
 /**
  * QQ 9.x（NT 架构）下群列表的唯一来源。
@@ -62,7 +73,7 @@ object GroupListCache {
             "onGroupListUpdate" -> handleUpdate(args)
             "onGroupListInited" -> {
                 inited = true
-                LogCenter.log("[GroupListCache] 群列表就绪标记, 当前缓存 ${map.size} 个")
+                logAsync("[GroupListCache] 群列表就绪标记, 当前缓存 ${map.size} 个")
             }
             else -> Unit
         }
@@ -87,6 +98,6 @@ object GroupListCache {
                 infos.forEach { map[it.groupCode] = it }
             }
         }
-        LogCenter.log("[GroupListCache] $type 推来 ${infos.size} 个, 合计 ${map.size} 个")
+        logAsync("[GroupListCache] $type 推来 ${infos.size} 个, 合计 ${map.size} 个")
     }
 }

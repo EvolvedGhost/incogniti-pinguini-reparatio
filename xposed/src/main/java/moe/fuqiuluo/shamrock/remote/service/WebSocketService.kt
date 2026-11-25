@@ -20,6 +20,7 @@ import moe.fuqiuluo.shamrock.xposed.helper.AppRuntimeFetcher
 import org.java_websocket.WebSocket
 import org.java_websocket.handshake.ClientHandshake
 import java.net.URI
+import moe.fuqiuluo.shamrock.xposed.helper.ImageRes
 
 internal class WebSocketService(
     host: String,
@@ -60,6 +61,9 @@ internal class WebSocketService(
     }
 
     override fun onOpen(conn: WebSocket, handshake: ClientHandshake) {
+        // 客户端连的是 WS 端口，握手里的 Host 就是它实际可达的地址，
+        // 记录下来供 /res 资源链接使用（Ktor 的拦截只覆盖 HTTP 端口，看不到这里）
+        runCatching { ImageRes.observeHost(handshake.getFieldValue("Host")) }
         val token = ShamrockConfig.getActiveWebSocketConfig()?.token ?: ShamrockConfig.getToken()
         if (token.isNotBlank()) {
             var accessToken = handshake.getFieldValue("access_token")

@@ -14,6 +14,24 @@ import moe.fuqiuluo.shamrock.tools.asJsonObject
 import moe.fuqiuluo.shamrock.tools.asString
 import moe.fuqiuluo.shamrock.tools.json
 
+/**
+ * 元素实例 → 所属消息的元信息。
+ *
+ * 富媒体下载接口需要 msgId / msgSeq / msgRandom / msgTime，而转换器只拿到消息元素，
+ * 因此以元素实例（同一对象）为键暂存，读取一次即移除。
+ */
+internal object ElemMeta {
+    private val map = java.util.concurrent.ConcurrentHashMap<Int, LongArray>()
+    private const val MAX = 512
+
+    fun put(elem: MsgElement, msgId: Long, msgSeq: Long, msgRandom: Long, msgTime: Long) {
+        if (map.size > MAX) map.clear()
+        map[System.identityHashCode(elem)] = longArrayOf(msgId, msgSeq, msgRandom, msgTime)
+    }
+
+    fun take(elem: MsgElement): LongArray? = map.remove(System.identityHashCode(elem))
+}
+
 internal sealed class MessageElemConverter: IMessageConvert {
     /**
      * 文本 / 艾特 消息转换消息段
@@ -141,10 +159,13 @@ internal sealed class MessageElemConverter: IMessageConvert {
             // md5 直链已 404，originImageUrl 又缺 rkey。
             // sourcePath 有文件就直接复制；没有则登记并后台让 QQ 内核下载（不阻塞这里）。
             val localUrl = runCatching {
-                moe.fuqiuluo.shamrock.xposed.helper.ImageRes.publish(md5, image.sourcePath)
-                    ?: moe.fuqiuluo.shamrock.xposed.helper.ImageRes.ensure(
-                        md5, chatType, peerId, subPeer, element
-                    )
+                val meta = ElemMeta.take(element)
+                moe.fuqiuluo.shamrock.xposed.helper.ImageRes.ensure(
+                    md5, chatType, peerId, subPeer, element,
+                    sourcePath = image.sourcePath,
+                    msgId = meta?.get(0) ?: 0L, msgSeq = meta?.get(1) ?: 0L,
+                    msgRandom = meta?.get(2) ?: 0L, msgTime = meta?.get(3) ?: 0L
+                )
             }.getOrNull()
             if (localUrl == null) {
                 moe.fuqiuluo.shamrock.helper.LogCenter.log(
