@@ -30,7 +30,9 @@ interface MessageMappingDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     fun insert(mapping: MessageMapping)
 
-    @Insert(onConflict = OnConflictStrategy.ABORT)
+    // 冲突时保留已有映射而不是抛异常：同一条消息被再次解析（历史回捞、重复投递）
+    // 时，ABORT 会把 SQLiteConstraintException 抛到调用方，整个接口直接失败。
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     fun insertNotExist(mapping: MessageMapping)
 
     @Query("UPDATE message_mapping_v2 SET msgSeq = :msgSeq WHERE msgHashId = :hash")
