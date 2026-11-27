@@ -41,7 +41,8 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         silk.cpp
         group_honor.cpp
         message.cpp
-        shamrock.cpp)
+        shamrock.cpp
+        jni_register.cpp)
 
 # Specifies libraries CMake should link to your target library. You
 # can link libraries from various origins, such as libraries defined in this

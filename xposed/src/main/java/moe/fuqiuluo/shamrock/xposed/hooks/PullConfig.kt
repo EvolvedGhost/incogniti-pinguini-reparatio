@@ -7,6 +7,8 @@ import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
+import moe.fuqiuluo.shamrock.helper.Level
+import moe.fuqiuluo.shamrock.helper.LogCenter
 import moe.fuqiuluo.shamrock.remote.HTTPServer
 import moe.fuqiuluo.shamrock.remote.service.config.ShamrockConfig
 import moe.fuqiuluo.shamrock.utils.PlatformUtils
@@ -27,7 +29,47 @@ class PullConfig: IAction {
         var isConfigOk = false
     }
 
-    private external fun testNativeLibrary(): String
+    @Volatile
+    private var nativeAvailable = true
+
+    private fun testNativeLibrary(): String {
+        if (nativeAvailable) {
+            try {
+                return nativeTestNativeLibrary()
+            } catch (e: Throwable) {
+                if (!markNativeUnavailable(e)) throw e
+            }
+        }
+        return "Shamrock Kotlin 兼容模式"
+    }
+
+    private fun markNativeUnavailable(error: Throwable): Boolean {
+        if (!containsUnsatisfiedLinkError(error)) {
+            return false
+        }
+        synchronized(this) {
+            if (nativeAvailable) {
+                nativeAvailable = false
+                LogCenter.log("PullConfig 原生方法不可用，已切换到 Kotlin 实现", Level.WARN)
+            }
+        }
+        return true
+    }
+
+    private fun containsUnsatisfiedLinkError(error: Throwable): Boolean {
+        var current: Throwable? = error
+        var depth = 0
+        while (current != null && depth < 16) {
+            if (current is UnsatisfiedLinkError) {
+                return true
+            }
+            current = current.cause
+            depth++
+        }
+        return false
+    }
+
+    private external fun nativeTestNativeLibrary(): String
 
     override fun invoke(ctx: Context) {
         if (!PlatformUtils.isMainProcess()) return

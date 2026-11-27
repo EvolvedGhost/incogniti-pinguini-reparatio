@@ -29,8 +29,12 @@ import moe.fuqiuluo.shamrock.tools.jsonArray
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 import kotlin.math.abs
+import kotlin.random.Random
 
 internal object MessageHelper {
+    @Volatile
+    private var nativeAvailable = true
+
     suspend fun sendMessageWithoutMsgId(
         chatType: Int,
         peerId: String,
@@ -368,11 +372,20 @@ internal object MessageHelper {
         database.messageMappingDao().insertNotExist(mapping)
     }
 
-    external fun createMessageUniseq(chatType: Int, time: Long): Long
+    fun createMessageUniseq(chatType: Int, time: Long): Long {
+        if (nativeAvailable) {
+            try {
+                return nativeCreateMessageUniseq(chatType, time)
+            } catch (e: Throwable) {
+                if (!markNativeUnavailable(e)) throw e
+            }
+        }
+        return kotlinCreateMessageUniseq(chatType, time)
+    }
 
     fun decodeCQCode(code: String): JsonArray {
         val arrayList = ArrayList<JsonElement>()
-        val msgList = nativeDecodeCQCode(code)
+        val msgList = decodeCQCodeCompat(code)
         msgList.forEach {
             val params = hashMapOf<String, JsonElement>()
             it.forEach { (key, value) ->
@@ -390,7 +403,7 @@ internal object MessageHelper {
     }
 
     fun encodeCQCode(msg: List<Map<String, JsonElement>>): String {
-        return nativeEncodeCQCode(msg.map {
+        val segment = msg.map {
             val params = hashMapOf<String, String>()
             it.forEach { (key, value) ->
                 if (key != "type") {
@@ -402,8 +415,205 @@ internal object MessageHelper {
                 }
             }
             params
-        })
+        }
+        return encodeCQCodeCompat(segment)
     }
+
+    private fun kotlinCreateMessageUniseq(chatType: Int, time: Long): Long {
+        val uniseq = (time / 1000L) shl 32
+        val msgType = chatType.toLong()
+        val random = abs(Random.nextInt()).toLong() and 0xffffff00L
+        return uniseq or random or msgType
+    }
+
+    private fun decodeCQCodeCompat(code: String): List<Map<String, String>> {
+        if (nativeAvailable) {
+            try {
+                return nativeDecodeCQCode(code)
+            } catch (e: Throwable) {
+                if (!markNativeUnavailable(e)) throw e
+            }
+        }
+        return decodeCQCodeFallback(code)
+    }
+
+    private fun encodeCQCodeCompat(segment: List<Map<String, String>>): String {
+        if (nativeAvailable) {
+            try {
+                return nativeEncodeCQCode(segment)
+            } catch (e: Throwable) {
+                if (!markNativeUnavailable(e)) throw e
+            }
+        }
+        return encodeCQCodeFallback(segment)
+    }
+
+    private fun decodeCQCodeFallback(code: String): List<Map<String, String>> {
+        val dest = ArrayList<Map<String, String>>()
+        val cache = StringBuilder()
+        val kv = HashMap<String, String>()
+        var keyTmp = ""
+        var isStart = false
+        var index = 0
+        while (index < code.length) {
+            when (val c = code[index]) {
+                '[' -> {
+                    if (isStart) {
+                        return ArrayList()
+                    }
+                    if (cache.isNotEmpty()) {
+                        val textKv = HashMap<String, String>()
+                        putIfAbsent(textKv, "_type", "text")
+                        putIfAbsent(textKv, "text", decodeCQText(cache.toString()))
+                        dest.add(textKv)
+                        cache.clear()
+                    }
+                    if (index + 4 <= code.length && code.regionMatches(index, "[CQ:", 0, 4)) {
+                        isStart = true
+                        index += 4
+                        continue
+                    }
+                    cache.append('[')
+                }
+
+                '=' -> {
+                    if (isStart) {
+                        if (cache.isEmpty()) {
+                            return ArrayList()
+                        }
+                        if (keyTmp.isEmpty()) {
+                            keyTmp = cache.toString()
+                            cache.clear()
+                        } else {
+                            cache.append('=')
+                        }
+                    } else {
+                        cache.append('=')
+                    }
+                }
+
+                ',' -> {
+                    if (isStart) {
+                        if (!kv.containsKey("_type") && cache.isNotEmpty()) {
+                            putIfAbsent(kv, "_type", cache.toString())
+                            cache.clear()
+                        } else if (keyTmp.isNotEmpty()) {
+                            putIfAbsent(kv, keyTmp, decodeCQValue(cache.toString()))
+                            cache.clear()
+                            keyTmp = ""
+                        }
+                    } else {
+                        cache.append(',')
+                    }
+                }
+
+                ']' -> {
+                    if (isStart) {
+                        if (cache.isNotEmpty()) {
+                            if (keyTmp.isNotEmpty()) {
+                                putIfAbsent(kv, keyTmp, decodeCQValue(cache.toString()))
+                            } else {
+                                putIfAbsent(kv, "_type", cache.toString())
+                            }
+                            dest.add(HashMap(kv))
+                            kv.clear()
+                            keyTmp = ""
+                            cache.clear()
+                            isStart = false
+                        }
+                    } else {
+                        cache.append(']')
+                    }
+                }
+
+                else -> cache.append(c)
+            }
+            index++
+        }
+        if (cache.isNotEmpty()) {
+            val textKv = HashMap<String, String>()
+            putIfAbsent(textKv, "_type", "text")
+            putIfAbsent(textKv, "text", decodeCQText(cache.toString()))
+            dest.add(textKv)
+        }
+        return dest
+    }
+
+    private fun encodeCQCodeFallback(segment: List<Map<String, String>>): String {
+        val result = StringBuilder()
+        segment.forEach { params ->
+            val type = params["_type"]
+            if (type == "text") {
+                result.append(encodeCQValue(params["text"] ?: ""))
+            } else {
+                result.append("[CQ:").append(type ?: "")
+                params.forEach { (key, value) ->
+                    if (key != "_type") {
+                        result.append(',').append(key).append('=').append(encodeCQValue(value))
+                    }
+                }
+                result.append(']')
+            }
+        }
+        return result.toString()
+    }
+
+    private fun decodeCQText(value: String): String {
+        return value
+            .replace("&#91;", "[")
+            .replace("&#93;", "]")
+            .replace("&amp;", "&")
+    }
+
+    private fun decodeCQValue(value: String): String {
+        return value
+            .replace("&#91;", "[")
+            .replace("&#93;", "]")
+            .replace("&#44;", ",")
+            .replace("&amp;", "&")
+    }
+
+    private fun encodeCQValue(value: String): String {
+        return value
+            .replace("&", "&amp;")
+            .replace("[", "&#91;")
+            .replace("]", "&#93;")
+            .replace(",", "&#44;")
+    }
+
+    private fun putIfAbsent(map: HashMap<String, String>, key: String, value: String) {
+        if (!map.containsKey(key)) {
+            map[key] = value
+        }
+    }
+
+    private fun markNativeUnavailable(error: Throwable): Boolean {
+        if (!containsUnsatisfiedLinkError(error)) {
+            return false
+        }
+        synchronized(this) {
+            if (nativeAvailable) {
+                nativeAvailable = false
+                LogCenter.log("MessageHelper 原生方法不可用，已切换到 Kotlin 实现", Level.WARN)
+            }
+        }
+        return true
+    }
+
+    private fun containsUnsatisfiedLinkError(error: Throwable): Boolean {
+        var current: Throwable? = error
+        var depth = 0
+        while (current != null && depth < 16) {
+            if (current is UnsatisfiedLinkError) {
+                return true
+            }
+            current = current.cause
+            depth++
+        }
+        return false
+    }
+
+    private external fun nativeCreateMessageUniseq(chatType: Int, time: Long): Long
 
     private external fun nativeDecodeCQCode(code: String): List<Map<String, String>>
     private external fun nativeEncodeCQCode(segment: List<Map<String, String>>): String

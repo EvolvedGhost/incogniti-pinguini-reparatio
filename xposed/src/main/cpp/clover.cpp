@@ -6,6 +6,36 @@
 static JavaVM *global_jvm = nullptr;
 static HookFunType hook_function = nullptr;
 
+extern "C" {
+JNIEXPORT jboolean JNICALL
+Java_moe_fuqiuluo_shamrock_xposed_XposedEntry_00024Companion_injected(JNIEnv *, jobject);
+JNIEXPORT jboolean JNICALL
+Java_moe_fuqiuluo_shamrock_xposed_XposedEntry_00024Companion_hasEnv(JNIEnv *, jobject);
+JNIEXPORT jboolean JNICALL
+Java_moe_fuqiuluo_shamrock_xposed_hooks_AntiDetection_antiNativeDetections(JNIEnv *, jobject);
+}
+
+namespace {
+
+void registerNativeMethods(JNIEnv *env, const char *className,
+                           const JNINativeMethod *methods, int count) {
+    jclass clazz = env->FindClass(className);
+    if (clazz == nullptr) {
+        env->ExceptionClear();
+        LOGI("[Shamrock] class not found at load time: %s", className);
+        return;
+    }
+    if (env->RegisterNatives(clazz, methods, count) == JNI_OK) {
+        LOGI("[Shamrock] registered %d native methods for %s", count, className);
+    } else {
+        env->ExceptionClear();
+        LOGI("[Shamrock] RegisterNatives failed for %s", className);
+    }
+    env->DeleteLocalRef(clazz);
+}
+
+}  // namespace
+
 extern "C" [[gnu::visibility("default")]] [[gnu::used]]
 jint JNI_OnLoad(JavaVM *jvm, void*) {
     global_jvm = jvm;
@@ -14,6 +44,26 @@ jint JNI_OnLoad(JavaVM *jvm, void*) {
 
     // do something
     LOGI("[Shamrock] JNI_OnLoad NativeModule Init: %p", env);
+
+    static const JNINativeMethod xposedEntryMethods[] = {
+            {const_cast<char *>("injected"), const_cast<char *>("()Z"),
+             reinterpret_cast<void *>(Java_moe_fuqiuluo_shamrock_xposed_XposedEntry_00024Companion_injected)},
+            {const_cast<char *>("hasEnv"), const_cast<char *>("()Z"),
+             reinterpret_cast<void *>(Java_moe_fuqiuluo_shamrock_xposed_XposedEntry_00024Companion_hasEnv)},
+    };
+    static const JNINativeMethod antiDetectionMethods[] = {
+            {const_cast<char *>("antiNativeDetections"), const_cast<char *>("()Z"),
+             reinterpret_cast<void *>(Java_moe_fuqiuluo_shamrock_xposed_hooks_AntiDetection_antiNativeDetections)},
+    };
+
+    if (env != nullptr) {
+        registerNativeMethods(env, "moe/fuqiuluo/shamrock/xposed/XposedEntry$Companion",
+                              xposedEntryMethods,
+                              sizeof(xposedEntryMethods) / sizeof(xposedEntryMethods[0]));
+        registerNativeMethods(env, "moe/fuqiuluo/shamrock/xposed/hooks/AntiDetection",
+                              antiDetectionMethods,
+                              sizeof(antiDetectionMethods) / sizeof(antiDetectionMethods[0]));
+    }
 
     if (attach == 1) {
         JNIHelper::delJNIEnv(jvm);
