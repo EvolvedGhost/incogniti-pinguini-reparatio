@@ -32,6 +32,9 @@ internal object ShamrockConfig {
         return mmkv.getBoolean("isInit", false)
     }
 
+    /** 配置目录下的文件路径，供与 config.json 同目录的附属缓存使用 */
+    fun resolveConfigFile(name: String): File = ConfigDir.resolve(name)
+
     private fun updateConfig(config: ServiceConfig = Config) {
         ConfigDir.resolve("config.json").writeText(GlobalJson5.encodeToString(config))
     }

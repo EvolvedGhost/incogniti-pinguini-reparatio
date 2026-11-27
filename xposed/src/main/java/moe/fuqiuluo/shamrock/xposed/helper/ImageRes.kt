@@ -12,6 +12,8 @@ import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.security.MessageDigest
+import java.lang.reflect.InvocationTargetException
+import java.lang.reflect.Modifier
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
@@ -38,6 +40,23 @@ object ImageRes {
     private const val MAX_PENDING = 12            // 同时等待落盘的上限
     private const val THUMB_FALLBACK_WAIT_MS = 8_000L  // 原图等这么久不到就退缩略图
     private const val MAX_PUBLISHED = 4096        // 已发布 URL 缓存上限
+    private const val NATIVE_CONTEXT_TTL = 10 * 60_000L // 原生直链兜底上下文存活时间
+    private const val MAX_NATIVE_CONTEXT = 4096   // 原生直链兜底上下文上限
+    private const val MAX_PIC_DUMP = 5            // 诊断日志最多打印的图片数
+    private const val MAX_PIC_DUMP_STRING = 300   // 诊断日志里的字符串长度上限
+
+    private val picDumpMd5 = ConcurrentHashMap.newKeySet<String>()
+
+    /** 供 /res 在本地取不到时申请原生直链；element 与聊天上下文保留到过期 */
+    data class Pending(
+        val element: MsgElement,
+        val chatType: Int,
+        val peerUid: String,
+        val groupUin: Long,
+        val expireAt: Long
+    )
+
+    private val pending = ConcurrentHashMap<String, Pending>()
 
     private val worker = Executors.newSingleThreadExecutor { r ->
         Thread(r, "shamrock-image-res").apply { isDaemon = true }
@@ -166,6 +185,94 @@ object ImageRes {
         if (published.size > MAX_PUBLISHED) published.clear()
     }
 
+    /** 将对象的所有无参 getter 拼成一行，任何单个 getter 失败都只影响自己的字段 */
+    private fun dumpGetters(target: Any?): String {
+        if (target == null) return "null"
+        return runCatching {
+            target.javaClass.methods
+                .asSequence()
+                .filter {
+                    it.parameterCount == 0 &&
+                        it.name.startsWith("get") &&
+                        it.name != "getClass" &&
+                        Modifier.isPublic(it.modifiers)
+                }
+                .sortedBy { it.name }
+                .joinToString(",") { method ->
+                    val field = method.name.removePrefix("get")
+                        .replaceFirstChar { char -> char.lowercaseChar() }
+                    val value = runCatching { formatDumpValue(method.invoke(target)) }
+                        .getOrElse { error ->
+                            val cause = (error as? InvocationTargetException)?.targetException ?: error
+                            return@joinToString "$field=<err:${cause.javaClass.simpleName}>"
+                        }
+                    "$field=$value"
+                }
+        }.getOrElse { "<err:${it.javaClass.simpleName}>" }
+    }
+
+    /** 诊断值格式化：数组只记长度，字符串截断并压成单行 */
+    private fun formatDumpValue(value: Any?): String = when {
+        value == null -> "null"
+        value.javaClass.isArray -> {
+            val type = value.javaClass.componentType?.simpleName ?: "object"
+            "$type[${java.lang.reflect.Array.getLength(value)}]"
+        }
+        value is String -> {
+            val text = if (value.length > MAX_PIC_DUMP_STRING) {
+                value.take(MAX_PIC_DUMP_STRING) + "..."
+            } else value
+            text.replace("\r", "\\r").replace("\n", "\\n")
+        }
+        else -> value.toString().replace("\r", "\\r").replace("\n", "\\n")
+    }
+
+    /** 每张图片最多诊断一次；全局最多打印 MAX_PIC_DUMP 张 */
+    private fun dumpPicOnce(md5: String, element: MsgElement?) {
+        runCatching {
+            val key = md5.lowercase()
+            synchronized(picDumpMd5) {
+                if (picDumpMd5.size >= MAX_PIC_DUMP || !picDumpMd5.add(key)) return
+            }
+            val msgElement = dumpGetters(element)
+            val picElement = dumpGetters(runCatching { element?.picElement }.getOrNull())
+            LogCenter.log(
+                "[PicDump] md5=$key MsgElement(${MsgElement::class.java.name})={$msgElement} " +
+                    "PicElement(com.tencent.qqnt.kernel.nativeinterface.PicElement)={$picElement}",
+                Level.INFO
+            )
+        }
+    }
+
+    private fun rememberPendingContext(
+        md5: String,
+        element: MsgElement?,
+        chatType: Int,
+        peerUid: String
+    ) {
+        if (element == null) return
+        val now = System.currentTimeMillis()
+        if (pending.size >= MAX_NATIVE_CONTEXT) {
+            pending.entries.removeIf { it.value.expireAt <= now }
+            if (pending.size >= MAX_NATIVE_CONTEXT) pending.clear()
+        }
+        val groupUin = if (chatType == MsgConstant.KCHATTYPEGROUP) {
+            peerUid.toLongOrNull() ?: 0L
+        } else {
+            0L
+        }
+        pending[md5] = Pending(element, chatType, peerUid, groupUin, now + NATIVE_CONTEXT_TTL)
+    }
+
+    /** 读取仍有效的原生直链兜底上下文；本地链路不需要时不会触发任何 OIDB 请求 */
+    fun pendingContext(md5: String): Pending? {
+        val key = md5.lowercase()
+        val entry = pending[key] ?: return null
+        if (entry.expireAt > System.currentTimeMillis()) return entry
+        pending.remove(key, entry)
+        return null
+    }
+
     /**
      * 保证图片最终可用：本地已有 -> 直接 URL；否则登记 + 后台触发下载，**立即返回 URL**。
      * 文件未到位时 /res 返回 404，稍后重试即可。
@@ -183,6 +290,8 @@ object ImageRes {
         msgTime: Long = 0L
     ): String {
         val key = md5.lowercase()
+        dumpPicOnce(key, element)
+        rememberPendingContext(key, element, chatType, peerUid)
         urlFor(key)?.let { return it }
 
         val url = "${resolveBase()}/res/$key"

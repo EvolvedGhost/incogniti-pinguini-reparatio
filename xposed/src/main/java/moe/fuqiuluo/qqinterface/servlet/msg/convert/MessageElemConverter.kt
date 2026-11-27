@@ -13,6 +13,7 @@ import moe.fuqiuluo.shamrock.helper.db.MessageDB
 import moe.fuqiuluo.shamrock.tools.asJsonObject
 import moe.fuqiuluo.shamrock.tools.asString
 import moe.fuqiuluo.shamrock.tools.json
+import moe.fuqiuluo.shamrock.xposed.hooks.PicRKeyHub
 
 /**
  * 元素实例 → 所属消息的元信息。
@@ -31,6 +32,7 @@ internal object ElemMeta {
 
     fun take(elem: MsgElement): LongArray? = map.remove(System.identityHashCode(elem))
 }
+
 
 internal sealed class MessageElemConverter: IMessageConvert {
     /**
@@ -177,9 +179,7 @@ internal sealed class MessageElemConverter: IMessageConvert {
                 type = "image",
                 data = hashMapOf(
                     "file" to md5,
-                    "url" to (localUrl ?: originUrl?.let { u ->
-                        if (u.startsWith("/")) "https://multimedia.nt.qq.com.cn$u" else u
-                    } ?: when(chatType) {
+                    "url" to (localUrl ?: signedImageUrl(originUrl) ?: when(chatType) {
                         MsgConstant.KCHATTYPEGROUP -> RichProtoSvc.getGroupPicDownUrl(md5)
                         MsgConstant.KCHATTYPEC2C -> RichProtoSvc.getC2CPicDownUrl(md5)
                         MsgConstant.KCHATTYPEGUILD -> RichProtoSvc.getGuildPicDownUrl(md5)
@@ -190,6 +190,21 @@ internal sealed class MessageElemConverter: IMessageConvert {
                 )
             )
         }
+
+        /**
+         * 构造可直接访问的图片地址。
+         *
+         * 元素自带的是相对路径，缺少访问凭证时远端会拒绝，因此优先用已缓存的凭证拼接；
+         * 没有凭证时退回原有拼法，保持与历史行为一致。
+         */
+        private fun signedImageUrl(url: String?): String? {
+            val raw = url?.takeIf { it.isNotBlank() } ?: return null
+            val absolute = if (raw.startsWith("/")) "https://multimedia.nt.qq.com.cn$raw" else raw
+            if (!raw.startsWith("/")) return absolute
+            val rkey = PicRKeyHub.preferredRkey() ?: return absolute
+            return PicRKeyHub.buildUrl(raw, rkey)
+        }
+
     }
 
     /**
