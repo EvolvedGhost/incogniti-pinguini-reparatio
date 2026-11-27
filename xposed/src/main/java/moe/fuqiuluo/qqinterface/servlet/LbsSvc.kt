@@ -1,11 +1,11 @@
 package moe.fuqiuluo.qqinterface.servlet
 
 import com.tencent.biz.map.trpcprotocol.LbsSendInfo
-import com.tencent.mobileqq.msf.core.MsfCore
 import com.tencent.proto.lbsshare.LBSShare
 import com.tencent.qqnt.kernel.nativeinterface.MsgConstant
 import moe.fuqiuluo.shamrock.helper.IllegalParamsException
 import moe.fuqiuluo.shamrock.tools.slice
+import moe.fuqiuluo.qqinterface.util.MsfSeq
 import kotlin.math.roundToInt
 
 internal object LbsSvc: BaseSvc() {
@@ -23,7 +23,7 @@ internal object LbsSvc: BaseSvc() {
         }.getOrNull())
         req.str_lat.set(lat.toString())
         req.str_lng.set(lon.toString())
-        sendPb("trpc.qq_lbs.qq_lbs_ark.LocationArk.SsoSendMessage", req.toByteArray(), MsfCore.getNextSeq())
+        sendPb("trpc.qq_lbs.qq_lbs_ark.LocationArk.SsoSendMessage", req.toByteArray(), MsfSeq.next())
 
         return Result.success(Unit)
     }

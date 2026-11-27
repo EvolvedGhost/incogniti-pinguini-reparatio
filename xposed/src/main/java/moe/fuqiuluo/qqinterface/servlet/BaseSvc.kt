@@ -4,7 +4,6 @@ package moe.fuqiuluo.qqinterface.servlet
 
 import android.os.Bundle
 import com.tencent.mobileqq.app.QQAppInterface
-import com.tencent.mobileqq.msf.core.MsfCore
 import com.tencent.mobileqq.pb.ByteStringMicro
 import com.tencent.qphone.base.remote.ToServiceMsg
 import io.ktor.utils.io.core.BytePacketBuilder
@@ -25,6 +24,7 @@ import moe.fuqiuluo.shamrock.utils.PlatformUtils
 import moe.fuqiuluo.shamrock.xposed.helper.AppRuntimeFetcher
 import moe.fuqiuluo.shamrock.xposed.helper.internal.DynamicReceiver
 import moe.fuqiuluo.shamrock.xposed.helper.internal.IPCRequest
+import moe.fuqiuluo.qqinterface.util.MsfSeq
 import protobuf.oidb.TrpcOidb
 import mqq.app.MobileQQ
 import tencent.im.oidb.oidb_sso
@@ -42,22 +42,22 @@ internal abstract class BaseSvc {
             return ToServiceMsg("mobileqq.service", app.currentAccountUin, cmd)
         }
 
-        suspend fun sendOidbAW(cmd: String, cmdId: Int, serviceId: Int, data: ByteArray, trpc: Boolean = false, timeout: Long = 5000L): ByteArray? {
-            val seq = MsfCore.getNextSeq()
+        suspend fun sendOidbAW(cmd: String, cmdId: Int, serviceId: Int, data: ByteArray, trpc: Boolean = false, timeout: Long = 5000L, seq: Int? = null): ByteArray? {
+            val requestSeq = seq ?: MsfSeq.next()
             val buffer = withTimeoutOrNull(timeout) {
                 suspendCancellableCoroutine { continuation ->
                     GlobalScope.launch(Dispatchers.Default) {
-                        DynamicReceiver.register(IPCRequest(cmd, seq) {
+                        DynamicReceiver.register(IPCRequest(cmd, requestSeq) {
                             val buffer = it.getByteArrayExtra("buffer")!!
                             continuation.resume(buffer)
                         })
                     }
-                    if (trpc) sendTrpcOidb(cmd, cmdId, serviceId, data, seq)
-                    else sendOidb(cmd, cmdId, serviceId, data, seq)
+                    if (trpc) sendTrpcOidb(cmd, cmdId, serviceId, data, requestSeq)
+                    else sendOidb(cmd, cmdId, serviceId, data, requestSeq)
                 }
             }.also {
                 if (it == null)
-                    DynamicReceiver.unregister(seq)
+                    DynamicReceiver.unregister(requestSeq)
             }?.copyOf()
             try {
                 if (buffer != null && buffer.size >= 5 && buffer[4] == 120.toByte()) {
@@ -72,7 +72,7 @@ internal abstract class BaseSvc {
         }
 
         suspend fun sendBufferAW(cmd: String, isPb: Boolean, data: ByteArray, timeout: Long = 5000L): ByteArray? {
-            val seq = MsfCore.getNextSeq()
+            val seq = MsfSeq.next()
             val buffer = withTimeoutOrNull<ByteArray?>(timeout) {
                 suspendCancellableCoroutine { continuation ->
                     GlobalScope.launch(Dispatchers.Default) {
@@ -114,6 +114,7 @@ internal abstract class BaseSvc {
             to.addAttribute("req_pb_protocol_flag", true)
             if (seq != -1) {
                 to.addAttribute("shamrock_seq", seq)
+                applyRequestSsoSeq(to, seq)
             }
             app.sendToService(to)
         }
@@ -132,15 +133,17 @@ internal abstract class BaseSvc {
             to.addAttribute("req_pb_protocol_flag", true)
             if (seq != -1) {
                 to.addAttribute("shamrock_seq", seq)
+                applyRequestSsoSeq(to, seq)
             }
             app.sendToService(to)
         }
 
-        fun sendBuffer(cmd: String, isPb: Boolean, buffer: ByteArray, seq: Int = MsfCore.getNextSeq()) {
+        fun sendBuffer(cmd: String, isPb: Boolean, buffer: ByteArray, seq: Int = MsfSeq.next()) {
             val toServiceMsg = ToServiceMsg("mobileqq.service", app.currentUin, cmd)
             toServiceMsg.putWupBuffer(buffer)
             toServiceMsg.addAttribute("req_pb_protocol_flag", isPb)
             toServiceMsg.addAttribute("shamrock_seq", seq)
+            applyRequestSsoSeq(toServiceMsg, seq)
             app.sendToService(toServiceMsg)
         }
     }
@@ -150,7 +153,7 @@ internal abstract class BaseSvc {
     }
 
     protected suspend fun sendAW(toServiceMsg: ToServiceMsg, timeout: Long = 5000L): ByteArray? {
-        val seq = MsfCore.getNextSeq()
+        val seq = MsfSeq.next()
         val buffer = withTimeoutOrNull<ByteArray?>(timeout) {
             suspendCancellableCoroutine { continuation ->
                 GlobalScope.launch(Dispatchers.Default) {
@@ -159,6 +162,7 @@ internal abstract class BaseSvc {
                         continuation.resume(buffer)
                     })
                     toServiceMsg.addAttribute("shamrock_seq", seq)
+                    applyRequestSsoSeq(toServiceMsg, seq)
                     send(toServiceMsg)
                 }
             }
@@ -190,4 +194,14 @@ internal abstract class BaseSvc {
         toServiceMsg.addAttribute("shamrock_seq", seq)
         app.sendToService(toServiceMsg)
     }
+}
+
+private fun applyRequestSsoSeq(to: ToServiceMsg, seq: Int) {
+    if (seq == -1) return
+    if (runCatching { to.setRequestSsoSeq(seq) }.isSuccess) return
+    if (runCatching {
+            to.javaClass.getMethod("setRequestSsoSeq", Int::class.javaPrimitiveType).invoke(to, seq)
+        }.isSuccess
+    ) return
+    runCatching { to.requestSsoSeq = seq }
 }
