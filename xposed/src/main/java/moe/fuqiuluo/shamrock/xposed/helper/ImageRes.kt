@@ -4,18 +4,26 @@ import com.tencent.qqnt.kernel.nativeinterface.FileTransNotifyInfo
 import com.tencent.qqnt.kernel.nativeinterface.MsgConstant
 import com.tencent.qqnt.kernel.nativeinterface.MsgElement
 import kotlinx.coroutines.delay
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 import moe.fuqiuluo.shamrock.helper.Level
 import moe.fuqiuluo.shamrock.helper.LogCenter
 import moe.fuqiuluo.shamrock.remote.service.config.ShamrockConfig
+import moe.fuqiuluo.shamrock.tools.GlobalJson5
 import moe.fuqiuluo.shamrock.utils.FileUtils
 import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Modifier
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 图片落盘与对外 URL。
@@ -40,12 +48,51 @@ object ImageRes {
     private const val MAX_PENDING = 12            // 同时等待落盘的上限
     private const val THUMB_FALLBACK_WAIT_MS = 8_000L  // 原图等这么久不到就退缩略图
     private const val MAX_PUBLISHED = 4096        // 已发布 URL 缓存上限
-    private const val NATIVE_CONTEXT_TTL = 10 * 60_000L // 原生直链兜底上下文存活时间
+    private const val NATIVE_CONTEXT_TTL = 60 * 60_000L // 原生直链兜底上下文存活时间
     private const val MAX_NATIVE_CONTEXT = 4096   // 原生直链兜底上下文上限
-    private const val MAX_PIC_DUMP = 5            // 诊断日志最多打印的图片数
-    private const val MAX_PIC_DUMP_STRING = 300   // 诊断日志里的字符串长度上限
 
-    private val picDumpMd5 = ConcurrentHashMap.newKeySet<String>()
+    private const val ORIGIN_INDEX_FILE = "origin.index"      // 原图地址索引文件名
+    private const val ORIGIN_INDEX_FILE_BAD = "origin.index.bad" // 解析失败时的现场备份
+    private const val MAX_ORIGIN_INDEX = 2000                 // 索引条目上限
+    private const val ORIGIN_TTL = 24 * 60 * 60_000L          // 索引条目有效期
+    private const val ORIGIN_PERSIST_INTERVAL = 60_000L       // 落盘最小间隔
+
+    /** 原图直链索引条目：重启后据此继续走 CDN 原图 */
+    @Serializable
+    data class OriginInfo(
+        val originImageUrl: String = "",
+        val fileSize: Long = 0L,
+        val savedAt: Long = 0L
+    )
+
+    /** origin.index 的单条记录，md5 作为字段值保存，避免作为对象键时被写成无法解析的形式 */
+    @Serializable
+    private data class OriginEntry(
+        val md5: String = "",
+        val originImageUrl: String = "",
+        val fileSize: Long = 0L,
+        val savedAt: Long = 0L
+    )
+
+    /** origin.index 的磁盘结构 */
+    @Serializable
+    private data class OriginIndexCache(
+        val entries: List<OriginEntry> = emptyList()
+    )
+
+    private val originIndex = ConcurrentHashMap<String, OriginInfo>()
+    private val originLoadLock = Any()
+    private val originWriteLock = Any()
+    @Volatile
+    private var originLoaded = false
+    @Volatile
+    private var originDirty = false
+    @Volatile
+    private var lastOriginPersistAt = 0L
+    private val originFlushScheduled = AtomicBoolean(false)
+    private val originPersistExecutor = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "shamrock-origin-index").apply { isDaemon = true }
+    }
 
     /** 供 /res 在本地取不到时申请原生直链；element 与聊天上下文保留到过期 */
     data class Pending(
@@ -185,65 +232,6 @@ object ImageRes {
         if (published.size > MAX_PUBLISHED) published.clear()
     }
 
-    /** 将对象的所有无参 getter 拼成一行，任何单个 getter 失败都只影响自己的字段 */
-    private fun dumpGetters(target: Any?): String {
-        if (target == null) return "null"
-        return runCatching {
-            target.javaClass.methods
-                .asSequence()
-                .filter {
-                    it.parameterCount == 0 &&
-                        it.name.startsWith("get") &&
-                        it.name != "getClass" &&
-                        Modifier.isPublic(it.modifiers)
-                }
-                .sortedBy { it.name }
-                .joinToString(",") { method ->
-                    val field = method.name.removePrefix("get")
-                        .replaceFirstChar { char -> char.lowercaseChar() }
-                    val value = runCatching { formatDumpValue(method.invoke(target)) }
-                        .getOrElse { error ->
-                            val cause = (error as? InvocationTargetException)?.targetException ?: error
-                            return@joinToString "$field=<err:${cause.javaClass.simpleName}>"
-                        }
-                    "$field=$value"
-                }
-        }.getOrElse { "<err:${it.javaClass.simpleName}>" }
-    }
-
-    /** 诊断值格式化：数组只记长度，字符串截断并压成单行 */
-    private fun formatDumpValue(value: Any?): String = when {
-        value == null -> "null"
-        value.javaClass.isArray -> {
-            val type = value.javaClass.componentType?.simpleName ?: "object"
-            "$type[${java.lang.reflect.Array.getLength(value)}]"
-        }
-        value is String -> {
-            val text = if (value.length > MAX_PIC_DUMP_STRING) {
-                value.take(MAX_PIC_DUMP_STRING) + "..."
-            } else value
-            text.replace("\r", "\\r").replace("\n", "\\n")
-        }
-        else -> value.toString().replace("\r", "\\r").replace("\n", "\\n")
-    }
-
-    /** 每张图片最多诊断一次；全局最多打印 MAX_PIC_DUMP 张 */
-    private fun dumpPicOnce(md5: String, element: MsgElement?) {
-        runCatching {
-            val key = md5.lowercase()
-            synchronized(picDumpMd5) {
-                if (picDumpMd5.size >= MAX_PIC_DUMP || !picDumpMd5.add(key)) return
-            }
-            val msgElement = dumpGetters(element)
-            val picElement = dumpGetters(runCatching { element?.picElement }.getOrNull())
-            LogCenter.log(
-                "[PicDump] md5=$key MsgElement(${MsgElement::class.java.name})={$msgElement} " +
-                    "PicElement(com.tencent.qqnt.kernel.nativeinterface.PicElement)={$picElement}",
-                Level.INFO
-            )
-        }
-    }
-
     private fun rememberPendingContext(
         md5: String,
         element: MsgElement?,
@@ -251,6 +239,8 @@ object ImageRes {
         peerUid: String
     ) {
         if (element == null) return
+        ensureOriginIndexLoaded()
+        rememberOriginFromElement(md5, element)
         val now = System.currentTimeMillis()
         if (pending.size >= MAX_NATIVE_CONTEXT) {
             pending.entries.removeIf { it.value.expireAt <= now }
@@ -273,6 +263,133 @@ object ImageRes {
         return null
     }
 
+    /** 查询持久化的原图直链索引；存活时间超过有效期的条目视为不存在并顺带清除 */
+    fun originInfo(md5: String): OriginInfo? {
+        ensureOriginIndexLoaded()
+        val key = md5.lowercase()
+        val info = originIndex[key] ?: return null
+        if (System.currentTimeMillis() - info.savedAt > ORIGIN_TTL) {
+            originIndex.remove(key, info)
+            markOriginDirty()
+            return null
+        }
+        return info
+    }
+
+    /** 首次使用时从磁盘恢复原图索引；文件缺失或解析失败一律按空表处理 */
+    private fun ensureOriginIndexLoaded() {
+        if (originLoaded) return
+        synchronized(originLoadLock) {
+            if (originLoaded) return
+            originLoaded = true
+            val file = runCatching { ShamrockConfig.resolveConfigFile(ORIGIN_INDEX_FILE) }.getOrNull()
+            if (file == null) {
+                LogCenter.log("[ImageRes] 无法获取配置目录，原图索引加载 0 条", Level.WARN)
+                return
+            }
+            if (!file.isFile) {
+                LogCenter.log("[ImageRes] 原图索引为空，加载 0 条")
+                return
+            }
+            val rawText = runCatching { file.readText() }.getOrNull()
+            val cache = rawText?.let { text ->
+                runCatching { GlobalJson5.decodeFromString<OriginIndexCache>(text) }.getOrElse { err ->
+                    // 解析失败时保留现场并删除坏文件，避免下一次写盘把旧索引整体覆盖
+                    runCatching {
+                        ShamrockConfig.resolveConfigFile(ORIGIN_INDEX_FILE_BAD).writeText(text)
+                        file.delete()
+                    }
+                    LogCenter.log(
+                        "[ImageRes] 解析原图索引失败（现场已备份为 $ORIGIN_INDEX_FILE_BAD）: " +
+                            "${err.javaClass.simpleName} head=" + text.take(200),
+                        Level.WARN
+                    )
+                    null
+                }
+            }
+            val now = System.currentTimeMillis()
+            var loaded = 0
+            cache?.entries?.forEach { entry ->
+                val key = entry.md5.lowercase()
+                if (key.isBlank() || entry.originImageUrl.isBlank()) return@forEach
+                if (now - entry.savedAt > ORIGIN_TTL) return@forEach
+                originIndex[key] = OriginInfo(entry.originImageUrl, entry.fileSize, entry.savedAt)
+                loaded++
+            }
+            pruneOriginIndex(now)
+            LogCenter.log("[ImageRes] 已加载原图索引 $loaded 条")
+        }
+    }
+
+    /** 把消息里携带的原图直链记入索引；没有直链时跳过 */
+    private fun rememberOriginFromElement(md5: String, element: MsgElement) {
+        val pic = runCatching { element.picElement }.getOrNull() ?: return
+        val url = runCatching { pic.originImageUrl }.getOrNull()
+        if (url.isNullOrBlank()) return
+        val size = runCatching { pic.fileSize }.getOrDefault(0L)
+        val key = md5.lowercase()
+        val now = System.currentTimeMillis()
+        originIndex[key] = OriginInfo(url, size, now)
+        pruneOriginIndex(now)
+        markOriginDirty()
+    }
+
+    /** 清除过期条目；仍超出上限时按 savedAt 从旧到新淘汰 */
+    private fun pruneOriginIndex(now: Long) {
+        originIndex.entries.removeIf { now - it.value.savedAt > ORIGIN_TTL }
+        if (originIndex.size <= MAX_ORIGIN_INDEX) return
+        originIndex.entries
+            .sortedBy { it.value.savedAt }
+            .take(originIndex.size - MAX_ORIGIN_INDEX)
+            .forEach { originIndex.remove(it.key) }
+    }
+
+    /** 标记索引待写盘，并按最小间隔节流调度一次后台写入 */
+    private fun markOriginDirty() {
+        originDirty = true
+        val elapsed = System.currentTimeMillis() - lastOriginPersistAt
+        val delay = (ORIGIN_PERSIST_INTERVAL - elapsed).coerceAtLeast(0L)
+        if (!originFlushScheduled.compareAndSet(false, true)) return
+        runCatching {
+            originPersistExecutor.schedule({ flushOriginIndex() }, delay, TimeUnit.MILLISECONDS)
+        }.onFailure {
+            originFlushScheduled.set(false)
+            LogCenter.log("[ImageRes] 调度原图索引写入失败: ${it.javaClass.simpleName}", Level.WARN)
+        }
+    }
+
+    /** 整体写盘：先写 .tmp 再原子改名；写入失败只告警并保留脏标记 */
+    private fun flushOriginIndex() {
+        originFlushScheduled.set(false)
+        if (!originDirty) return
+        synchronized(originWriteLock) {
+            if (!originDirty) return
+            val file = runCatching { ShamrockConfig.resolveConfigFile(ORIGIN_INDEX_FILE) }.getOrNull()
+            if (file == null) {
+                LogCenter.log("[ImageRes] 无法获取配置目录，跳过原图索引写入", Level.WARN)
+                return
+            }
+            originDirty = false
+            lastOriginPersistAt = System.currentTimeMillis()
+            pruneOriginIndex(lastOriginPersistAt)
+            val snapshot = originIndex.toMap()
+            val tmp = File(file.parentFile, file.name + ".tmp")
+            runCatching {
+                tmp.writeText(GlobalJson5.encodeToString(OriginIndexCache(snapshot.map { (k, v) -> OriginEntry(k, v.originImageUrl, v.fileSize, v.savedAt) })))
+                Files.move(
+                    tmp.toPath(),
+                    file.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE
+                )
+            }.onFailure {
+                tmp.delete()
+                originDirty = true
+                LogCenter.log("[ImageRes] 写入原图索引失败: ${it.javaClass.simpleName}", Level.WARN)
+            }
+        }
+    }
+
     /**
      * 保证图片最终可用：本地已有 -> 直接 URL；否则登记 + 后台触发下载，**立即返回 URL**。
      * 文件未到位时 /res 返回 404，稍后重试即可。
@@ -289,8 +406,8 @@ object ImageRes {
         msgRandom: Long = 0L,
         msgTime: Long = 0L
     ): String {
+        ensureOriginIndexLoaded()
         val key = md5.lowercase()
-        dumpPicOnce(key, element)
         rememberPendingContext(key, element, chatType, peerUid)
         urlFor(key)?.let { return it }
 

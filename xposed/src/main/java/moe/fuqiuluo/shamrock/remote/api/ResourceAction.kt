@@ -38,6 +38,34 @@ private data class RkeyHit(val type: UInt, val url: String)
  * 依次用候选 rkey 拼出原生直链并探测，命中返回类型与链接。
  * 整个过程总耗时不超过 [RKEY_PROBE_TOTAL_MS]，到点直接放弃。
  */
+/**
+ * 取可直接访问的远端原图地址。
+ *
+ * 校验通过的地址按图片缓存一段时间，避免同一张图被反复探测；
+ * 没有元素上下文或凭证时返回 null，由调用方退回本地副本。
+ */
+private suspend fun remoteOriginalUrl(md5: String): String? {
+    val now = System.currentTimeMillis()
+    verifiedRemote[md5]?.let { (url, expireAt) ->
+        if (expireAt > now) return url
+        verifiedRemote.remove(md5)
+    }
+    val origin = ImageRes.pendingContext(md5)
+        ?.element?.picElement?.originImageUrl
+        ?.takeIf { it.isNotBlank() }
+        ?: ImageRes.originInfo(md5)?.originImageUrl?.takeIf { it.isNotBlank() }
+        ?: return null
+    if (!PicRKeyHub.hasRkey()) return null
+    val hit = probeRkeyHit(origin, now + RKEY_PROBE_TOTAL_MS) ?: return null
+    if (verifiedRemote.size > MAX_VERIFIED_REMOTE) verifiedRemote.clear()
+    verifiedRemote[md5] = hit.url to (now + VERIFIED_REMOTE_TTL)
+    return hit.url
+}
+
+private val verifiedRemote = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
+private const val VERIFIED_REMOTE_TTL = 30 * 60_000L
+private const val MAX_VERIFIED_REMOTE = 2048
+
 private suspend fun probeRkeyHit(originImageUrl: String, deadline: Long): RkeyHit? {
     val budget = deadline - System.currentTimeMillis()
     if (budget <= 0L) return null
@@ -180,34 +208,19 @@ fun Routing.fetchRes() {
             val md5 = call.request.document()
             val startAt = System.currentTimeMillis()
             val ua = call.request.headers["User-Agent"] ?: "-"
+            // 优先取远端原图：本地副本多为内核带回的缩略图，与原图尺寸差距明显
+            val remote = remoteOriginalUrl(md5)
+            if (remote != null) {
+                LogCenter.log("[res] $md5 302 原图 waited=${System.currentTimeMillis() - startAt}ms ua=$ua")
+                call.response.headers.append(HttpHeaders.Location, remote)
+                call.respond(HttpStatusCode.Found)
+                return@get
+            }
+            // 远端取不到时退回本地副本
             var file = ImageRes.await(md5)
-            // 内核取不到时，退到 QQ 本地已有的任何版本（多为用户看过的缩略图）
             if (file == null) {
                 file = ImageRes.localFallback(md5)
                 if (file != null) LogCenter.log("[res] $md5 用本地兜底文件 ${file.name} (${file.length()}B)")
-            }
-            // 本地与内核下载都拿不到时，用已有的 rkey 探测原生直链并重定向。
-            if (file == null) {
-                val origin = ImageRes.pendingContext(md5)
-                    ?.element?.picElement?.originImageUrl
-                    ?.takeIf { it.isNotBlank() }
-                if (origin != null) {
-                    if (PicRKeyHub.hasRkey()) {
-                        val hit = probeRkeyHit(origin, System.currentTimeMillis() + RKEY_PROBE_TOTAL_MS)
-                        if (hit != null) {
-                            LogCenter.log(
-                                "[res] $md5 302 命中 rkeyType=${hit.type} " +
-                                    "waited=${System.currentTimeMillis() - startAt}ms"
-                            )
-                            call.response.headers.append(HttpHeaders.Location, hit.url)
-                            call.respond(HttpStatusCode.Found)
-                            return@get
-                        }
-                        LogCenter.log("[res] $md5 候选 rkey 全部不可用", Level.WARN)
-                    } else {
-                        LogCenter.log("[res] $md5 无可用 rkey", Level.WARN)
-                    }
-                }
             }
             val waited = System.currentTimeMillis() - startAt
             if (file == null) {
