@@ -6,6 +6,7 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
 import io.ktor.server.request.document
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondOutputStream
 import io.ktor.server.http.content.LocalFileContent
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.Routing
@@ -13,13 +14,13 @@ import io.ktor.server.routing.get
 import io.ktor.server.routing.route
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 import moe.fuqiuluo.shamrock.remote.action.handlers.*
 import moe.fuqiuluo.shamrock.helper.Level
 import moe.fuqiuluo.shamrock.helper.LogCenter
 import moe.fuqiuluo.shamrock.tools.*
 import moe.fuqiuluo.shamrock.xposed.helper.ImageRes
 import moe.fuqiuluo.shamrock.xposed.hooks.PicRKeyHub
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -28,110 +29,80 @@ private fun formatFileName(file: String): String = file
     .replace(" ", "")
     .split(".")[0].lowercase()
 
-private const val RKEY_PROBE_TOTAL_MS = 5_000L
-private const val RKEY_PROBE_TRY_MS = 2_000L
-private const val RKEY_PROBE_UA = "Shamrock/1.0"
+private const val REMOTE_CONNECT_TIMEOUT_MS = 4_000
+private const val REMOTE_READ_TIMEOUT_MS = 10_000
+private const val REMOTE_UA = "Shamrock/1.0"
 
-private data class RkeyHit(val type: UInt, val url: String)
-
-/**
- * 依次用候选 rkey 拼出原生直链并探测，命中返回类型与链接。
- * 整个过程总耗时不超过 [RKEY_PROBE_TOTAL_MS]，到点直接放弃。
- */
-/**
- * 取可直接访问的远端原图地址。
- *
- * 校验通过的地址按图片缓存一段时间，避免同一张图被反复探测；
- * 没有元素上下文或凭证时返回 null，由调用方退回本地副本。
- */
-private suspend fun remoteOriginalUrl(md5: String): String? {
-    val now = System.currentTimeMillis()
-    verifiedRemote[md5]?.let { (url, expireAt) ->
-        if (expireAt > now) return url
-        verifiedRemote.remove(md5)
+/** 已取回内容的远端连接包装，关闭时一并释放连接 */
+private class RemoteImage(
+    val stream: InputStream,
+    val contentType: String,
+    val contentLength: Long,
+    private val connection: HttpURLConnection
+) {
+    fun close() {
+        runCatching { stream.close() }
+        runCatching { connection.disconnect() }
     }
-    val origin = ImageRes.pendingContext(md5)
-        ?.element?.picElement?.originImageUrl
-        ?.takeIf { it.isNotBlank() }
-        ?: ImageRes.originInfo(md5)?.originImageUrl?.takeIf { it.isNotBlank() }
-        ?: return null
-    if (!PicRKeyHub.hasRkey()) return null
-    val hit = probeRkeyHit(origin, now + RKEY_PROBE_TOTAL_MS) ?: return null
-    if (verifiedRemote.size > MAX_VERIFIED_REMOTE) verifiedRemote.clear()
-    verifiedRemote[md5] = hit.url to (now + VERIFIED_REMOTE_TTL)
-    return hit.url
 }
 
-private val verifiedRemote = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
-private const val VERIFIED_REMOTE_TTL = 30 * 60_000L
-private const val MAX_VERIFIED_REMOTE = 2048
+/** 上一次取到内容所用的凭证类型，下次优先尝试，减少无用请求 */
+@Volatile
+private var preferredRkeyType: UInt? = null
 
-private suspend fun probeRkeyHit(originImageUrl: String, deadline: Long): RkeyHit? {
-    val budget = deadline - System.currentTimeMillis()
-    if (budget <= 0L) return null
-    return withTimeoutOrNull(budget) {
-        withContext(Dispatchers.IO) {
-            val candidates = PicRKeyHub.candidatesWithType()
-            if (candidates.isEmpty()) return@withContext null
-            for ((rkey, type) in candidates) {
-                if (System.currentTimeMillis() >= deadline) break
-                val url = PicRKeyHub.buildUrl(originImageUrl, rkey)
-                if (probeUrl(url, deadline)) return@withContext RkeyHit(type, url)
+private fun originOf(md5: String): String? =
+    ImageRes.pendingContext(md5)?.element?.picElement?.originImageUrl?.takeIf { it.isNotBlank() }
+        ?: ImageRes.originInfo(md5)?.originImageUrl?.takeIf { it.isNotBlank() }
+
+private fun expectedSizeOf(md5: String): Long =
+    ImageRes.pendingContext(md5)?.element?.picElement?.fileSize
+        ?: ImageRes.originInfo(md5)?.fileSize
+        ?: 0L
+
+/** 文件长度是否已达到原图应有的大小，留 2% 余量 */
+private fun isOriginalSize(actual: Long, expected: Long): Boolean =
+    expected <= 0L || actual * 100L >= expected * 98L
+
+/**
+ * 取回远端原图内容。
+ *
+ * 内容由本服务取回后直接转发给客户端，避免依赖客户端是否跟随重定向；
+ * 依次尝试已缓存的凭证，命中后记住该凭证类型，后续请求优先使用。
+ */
+private suspend fun openRemoteImage(md5: String): RemoteImage? = withContext(Dispatchers.IO) {
+    val origin = originOf(md5) ?: return@withContext null
+    if (!PicRKeyHub.hasRkey()) return@withContext null
+    val preferred = preferredRkeyType
+    val candidates = PicRKeyHub.candidatesWithType()
+        .sortedBy { if (it.second == preferred) 0 else 1 }
+    for ((rkey, type) in candidates) {
+        var connection: HttpURLConnection? = null
+        try {
+            connection = (URL(PicRKeyHub.buildUrl(origin, rkey)).openConnection() as HttpURLConnection).apply {
+                connectTimeout = REMOTE_CONNECT_TIMEOUT_MS
+                readTimeout = REMOTE_READ_TIMEOUT_MS
+                instanceFollowRedirects = false
+                useCaches = false
+                setRequestProperty("User-Agent", REMOTE_UA)
+                setRequestProperty("Accept", "image/*")
             }
-            null
+            if (connection.responseCode == HttpURLConnection.HTTP_OK) {
+                preferredRkeyType = type
+                return@withContext RemoteImage(
+                    stream = connection.inputStream,
+                    contentType = connection.contentType ?: "application/octet-stream",
+                    contentLength = connection.contentLengthLong,
+                    connection = connection
+                )
+            }
+            connection.disconnect()
+        } catch (_: Exception) {
+            runCatching { connection?.disconnect() }
         }
     }
+    null
 }
 
-/** HEAD 探测；服务端不支持 HEAD 时退化为 GET 读取 1 字节后关闭 */
-private fun probeUrl(url: String, deadline: Long): Boolean {
-    val headTimeout = timeoutWithin(deadline) ?: return false
-    var head: HttpURLConnection? = null
-    var headCode = -1
-    try {
-        head = openProbe(url, "HEAD", headTimeout)
-        headCode = head.responseCode
-    } catch (_: Exception) {
-        headCode = -1
-    } finally {
-        head?.disconnect()
-    }
-    if (headCode == HttpURLConnection.HTTP_OK) return true
-    // 服务端对 HEAD 的拒绝方式不统一（部分服务直接返回 400），
-    // 因此只要不是 200 就改用 GET 复核，避免把可用链接误判为失效。
-
-    val getTimeout = timeoutWithin(deadline) ?: return false
-    var get: HttpURLConnection? = null
-    return try {
-        get = openProbe(url, "GET", getTimeout)
-        // 只取头部少量字节，确认可读即可，不下载完整内容
-        get.setRequestProperty("Range", "bytes=0-1023")
-        val code = get.responseCode
-        (code == HttpURLConnection.HTTP_OK || code == 206) && get.inputStream.use { it.read() != -1 }
-    } catch (_: Exception) {
-        false
-    } finally {
-        get?.disconnect()
-    }
-}
-
-private fun openProbe(url: String, method: String, timeoutMs: Int): HttpURLConnection =
-    (URL(url).openConnection() as HttpURLConnection).apply {
-        requestMethod = method
-        connectTimeout = timeoutMs
-        readTimeout = timeoutMs
-        instanceFollowRedirects = false
-        useCaches = false
-        // 固定标识来源，且不携带任何 Cookie
-        setRequestProperty("User-Agent", RKEY_PROBE_UA)
-        setRequestProperty("Accept", "*/*")
-    }
-
-private fun timeoutWithin(deadline: Long): Int? {
-    val remaining = deadline - System.currentTimeMillis()
-    if (remaining < 100L) return null
-    return minOf(RKEY_PROBE_TRY_MS, remaining).toInt()
-}
 
 fun Routing.fetchRes() {
     getOrPost("/get_record") {
@@ -208,28 +179,44 @@ fun Routing.fetchRes() {
             val md5 = call.request.document()
             val startAt = System.currentTimeMillis()
             val ua = call.request.headers["User-Agent"] ?: "-"
-            // 优先取远端原图：本地副本多为内核带回的缩略图，与原图尺寸差距明显
-            val remote = remoteOriginalUrl(md5)
-            if (remote != null) {
-                LogCenter.log("[res] $md5 302 原图 waited=${System.currentTimeMillis() - startAt}ms ua=$ua")
-                call.response.headers.append(HttpHeaders.Location, remote)
-                call.respond(HttpStatusCode.Found)
+            val expected = expectedSizeOf(md5)
+            val local = ImageRes.await(md5) ?: ImageRes.localFallback(md5)
+            // 本地已是原图时直接返回，省掉一次远端下载
+            if (local != null && isOriginalSize(local.length(), expected)) {
+                LogCenter.log("[res] $md5 200 size=${local.length()} waited=${System.currentTimeMillis() - startAt}ms ua=$ua")
+                call.respond(LocalFileContent(local, ContentType.parse(ImageRes.mimeOf(local))))
                 return@get
             }
-            // 远端取不到时退回本地副本
-            var file = ImageRes.await(md5)
-            if (file == null) {
-                file = ImageRes.localFallback(md5)
-                if (file != null) LogCenter.log("[res] $md5 用本地兜底文件 ${file.name} (${file.length()}B)")
+            // 本地缺失或只是缩略图：取回远端原图后转发，客户端无需跟随重定向
+            val remote = openRemoteImage(md5)
+            if (remote != null) {
+                try {
+                    LogCenter.log(
+                        "[res] $md5 200 原图 size=${remote.contentLength} " +
+                            "waited=${System.currentTimeMillis() - startAt}ms ua=$ua"
+                    )
+                    call.respondOutputStream(ContentType.parse(remote.contentType)) {
+                        remote.stream.copyTo(this)
+                    }
+                    return@get
+                } catch (e: Exception) {
+                    LogCenter.log("[res] $md5 转发远端原图失败: ${e.javaClass.simpleName}", Level.WARN)
+                } finally {
+                    remote.close()
+                }
             }
-            val waited = System.currentTimeMillis() - startAt
-            if (file == null) {
-                LogCenter.log("[res] $md5 404 waited=${waited}ms ua=$ua", Level.WARN)
-                call.respond(HttpStatusCode.NotFound)
-            } else {
-                LogCenter.log("[res] $md5 200 size=${file.length()} waited=${waited}ms ua=$ua")
-                call.respond(LocalFileContent(file, ContentType.parse(ImageRes.mimeOf(file))))
+            // 远端不可用时退回本地副本，可能只是缩略图
+            if (local != null) {
+                LogCenter.log(
+                    "[res] $md5 200 size=${local.length()} expected=$expected " +
+                        "waited=${System.currentTimeMillis() - startAt}ms ua=$ua",
+                    Level.WARN
+                )
+                call.respond(LocalFileContent(local, ContentType.parse(ImageRes.mimeOf(local))))
+                return@get
             }
+            LogCenter.log("[res] $md5 404 waited=${System.currentTimeMillis() - startAt}ms ua=$ua", Level.WARN)
+            call.respond(HttpStatusCode.NotFound)
         }
     }
 }
